@@ -24,6 +24,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Bedtime
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Refresh
@@ -78,6 +79,7 @@ fun DashboardScreen(
     onResetNetwork: (String) -> Unit,
     onRefreshAll: () -> Unit,
     onAuthorizeHelix: () -> Unit,
+    onEnterNightScreen: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val colors = LocalDropColors.current
@@ -145,17 +147,32 @@ fun DashboardScreen(
                         }
                     }
 
-                    OutlinedButton(
-                        onClick = onRefreshAll,
-                        modifier = Modifier
-                            .height(48.dp)
-                            .testTag("dashboard_refresh_button"),
-                        border = BorderStroke(1.dp, colors.border),
-                        colors = ButtonDefaults.outlinedButtonColors(contentColor = colors.accent)
-                    ) {
-                        Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Sync")
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(
+                            onClick = onEnterNightScreen,
+                            modifier = Modifier
+                                .height(48.dp)
+                                .testTag("dashboard_night_screen_button"),
+                            border = BorderStroke(1.dp, colors.border),
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = colors.secondaryAccent)
+                        ) {
+                            Icon(Icons.Default.Bedtime, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Night")
+                        }
+
+                        OutlinedButton(
+                            onClick = onRefreshAll,
+                            modifier = Modifier
+                                .height(48.dp)
+                                .testTag("dashboard_refresh_button"),
+                            border = BorderStroke(1.dp, colors.border),
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = colors.accent)
+                        ) {
+                            Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Sync")
+                        }
                     }
                 }
 

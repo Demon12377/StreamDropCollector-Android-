@@ -1,5 +1,10 @@
 package com.example.ui.screens
 
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.PowerManager
+import android.provider.Settings
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -17,6 +22,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.BatteryChargingFull
 import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.OpenInNew
@@ -44,6 +50,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
@@ -62,6 +69,8 @@ import com.example.ui.components.SettingsToggleRow
 import com.example.ui.theme.KickGreen
 import com.example.ui.theme.LocalDropColors
 import com.example.ui.theme.StatusDanger
+import com.example.ui.theme.StatusOnline
+import com.example.ui.theme.StatusWarning
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -100,6 +109,12 @@ fun SettingsScreen(
     val twitchGames = remember(knownGames) { knownGames.filter { it.platform == Platform.TWITCH } }
     val kickGames = remember(knownGames) { knownGames.filter { it.platform == Platform.KICK } }
 
+    val context = LocalContext.current
+    val powerManager = remember { context.getSystemService(Context.POWER_SERVICE) as? PowerManager }
+    val isBatteryUnrestricted = remember(context) {
+        powerManager?.isIgnoringBatteryOptimizations(context.packageName) == true
+    }
+
     LazyColumn(
         modifier = modifier.fillMaxSize(),
         contentPadding = PaddingValues(16.dp),
@@ -118,6 +133,75 @@ fun SettingsScreen(
                     },
                     testTag = "setting_run_in_background"
                 )
+                SettingsToggleRow(
+                    title = "Overnight screen-off mode (Low battery & RAM)",
+                    subtitle = "Pauses background WebView video decoding and runs ultra-lightweight native HEAD audio heartbeats so mining runs overnight with the screen off.",
+                    checked = settings.overnightBatterySaver,
+                    onCheckedChange = { enabled ->
+                        onUpdateSettings { it.copy(overnightBatterySaver = enabled) }
+                    },
+                    testTag = "setting_overnight_battery_saver"
+                )
+
+                Spacer(modifier = Modifier.height(8.dp))
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = colors.insetBackground,
+                    border = BorderStroke(
+                        1.dp,
+                        if (isBatteryUnrestricted) StatusOnline.copy(alpha = 0.5f) else StatusWarning.copy(alpha = 0.5f)
+                    )
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                            Icon(
+                                Icons.Default.BatteryChargingFull,
+                                contentDescription = null,
+                                tint = if (isBatteryUnrestricted) StatusOnline else StatusWarning,
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Column {
+                                Text(
+                                    text = if (isBatteryUnrestricted) "Battery: Unrestricted" else "Battery Optimization Active",
+                                    style = MaterialTheme.typography.titleMedium,
+                                    color = if (isBatteryUnrestricted) StatusOnline else StatusWarning
+                                )
+                                Text(
+                                    text = if (isBatteryUnrestricted) {
+                                        "Ready for overnight screen-off drops."
+                                    } else {
+                                        "On Samsung/One UI set App Info → Battery → Unrestricted so the phone won't sleep DropCollector at night."
+                                    },
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = colors.textMuted
+                                )
+                            }
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        OutlinedButton(
+                            onClick = {
+                                val appDetailsIntent = Intent(
+                                    Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                    Uri.fromParts("package", context.packageName, null)
+                                ).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }
+                                runCatching { context.startActivity(appDetailsIntent) }
+                            },
+                            modifier = Modifier
+                                .height(48.dp)
+                                .testTag("open_battery_settings_button"),
+                            border = BorderStroke(1.dp, colors.border)
+                        ) {
+                            Text("App Battery", color = colors.accent)
+                        }
+                    }
+                }
             }
         }
 

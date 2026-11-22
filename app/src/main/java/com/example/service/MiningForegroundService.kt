@@ -37,17 +37,20 @@ class MiningForegroundService : Service() {
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var observerJob: Job? = null
+    private var wakeLock: android.os.PowerManager.WakeLock? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
+            releaseWakeLock()
             stopSelf()
             return START_NOT_STICKY
         }
 
         val app = application as DropCollectorApp
         app.notificationDispatcher.ensureChannels()
+        acquireWakeLock()
 
         val initialNotification = buildNotification("Stream Drop Collector", "Monitoring Twitch & Kick drops...")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -67,7 +70,7 @@ class MiningForegroundService : Service() {
                 val activeNames = sessions.filter { it.minerStatus == "Mining" }
                     .joinToString(", ") { "${it.account.platform.displayName}: ${it.progress.minedChannel.ifBlank { it.account.displayName }}" }
                 val text = if (miningCount > 0) {
-                    "Mining ($miningCount): $activeNames"
+                    "Night/BG Mining ($miningCount): $activeNames"
                 } else {
                     "Idle • ${sessions.count { it.account.enabled }} account(s) active"
                 }
@@ -77,6 +80,24 @@ class MiningForegroundService : Service() {
         }
 
         return START_STICKY
+    }
+
+    private fun acquireWakeLock() {
+        val pm = getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager ?: return
+        if (wakeLock?.isHeld == true) return
+        val wl = pm.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "DropCollector::OvernightMining")
+        wl.setReferenceCounted(false)
+        wl.acquire(12 * 60 * 60 * 1000L) // 12-hour safety cap for overnight session
+        wakeLock = wl
+    }
+
+    private fun releaseWakeLock() {
+        runCatching {
+            if (wakeLock?.isHeld == true) {
+                wakeLock?.release()
+            }
+        }
+        wakeLock = null
     }
 
     private fun buildNotification(title: String, content: String): android.app.Notification {
@@ -106,6 +127,7 @@ class MiningForegroundService : Service() {
 
     override fun onDestroy() {
         observerJob?.cancel()
+        releaseWakeLock()
         super.onDestroy()
     }
 }

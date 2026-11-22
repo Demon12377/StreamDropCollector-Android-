@@ -57,7 +57,7 @@ class WebViewMiningBridge {
         val webView = WebView(context).apply {
             settings.javaScriptEnabled = true
             settings.domStorageEnabled = true
-            settings.mediaPlaybackRequiresUserGesture = true
+            settings.mediaPlaybackRequiresUserGesture = false
             settings.loadsImagesAutomatically = false
             settings.blockNetworkImage = true
             settings.cacheMode = WebSettings.LOAD_DEFAULT
@@ -137,6 +137,8 @@ class WebViewMiningBridge {
         activeTwitchMeterAccountId = accountId
 
         withContext(Dispatchers.Main) {
+            webView.resumeTimers()
+            webView.onResume()
             applyCookie("https://www.twitch.tv", "auth-token", authToken)
             capturedHeaders.clear()
             val deferred = CompletableDeferred<Unit>()
@@ -171,6 +173,16 @@ class WebViewMiningBridge {
         )
     }
 
+    suspend fun suspendWebViewForLowPower(platform: Platform) = withContext(Dispatchers.Main) {
+        val wv = if (platform == Platform.TWITCH) twitchWebView else kickWebView
+        wv?.apply {
+            stopLoading()
+            loadUrl("about:blank")
+            onPause()
+            pauseTimers()
+        }
+    }
+
     suspend fun navigateAndPrepareTwitchStream(
         accountId: String,
         authToken: String,
@@ -180,7 +192,19 @@ class WebViewMiningBridge {
         val webView = twitchWebView ?: return false
         activeTwitchMeterAccountId = accountId
 
+        if (headOnly) {
+            withContext(Dispatchers.Main) {
+                webView.stopLoading()
+                webView.loadUrl("about:blank")
+                webView.onPause()
+                webView.pauseTimers()
+            }
+            return@withLock true
+        }
+
         withContext(Dispatchers.Main) {
+            webView.resumeTimers()
+            webView.onResume()
             applyCookie("https://www.twitch.tv", "auth-token", authToken)
             val deferred = CompletableDeferred<Unit>()
             twitchPageFinished = deferred
@@ -202,104 +226,67 @@ class WebViewMiningBridge {
             })();
             """.trimIndent()
         )
-
-        if (headOnly) {
-            startTwitchHeadOnlyLoop(webView, authToken, streamUrl)
-        }
         true
     }
 
-    private suspend fun startTwitchHeadOnlyLoop(webView: WebView, authToken: String, streamUrl: String) {
-        val login = streamUrl.trimEnd('/').substringAfterLast('/')
-        val script = """
-            (async () => {
-                if (window.__sdcAudio && !window.__sdcAudio.stopped) return JSON.stringify({ ok: true, already: true });
-                const login = ${JSONObject.quote(login)};
-                const headers = {
-                    'Client-ID': 'kimne78kx3ncx6brgo4mv6wki5h1ko',
-                    'Content-Type': 'text/plain; charset=UTF-8',
-                    'Authorization': 'OAuth ' + ${JSONObject.quote(authToken)}
-                };
-                const payload = {
-                    operationName: 'PlaybackAccessToken_Template',
-                    query: 'query PlaybackAccessToken_Template(${'$'}login: String!, ${'$'}isLive: Boolean!, ${'$'}vodID: ID!, ${'$'}isVod: Boolean!, ${'$'}playerType: String!) { streamPlaybackAccessToken(channelName: ${'$'}login, params: {platform: "android", playerBackend: "mediaplayer", playerType: ${'$'}playerType}) @include(if: ${'$'}isLive) { value signature __typename } }',
-                    variables: { isLive: true, login, isVod: false, vodID: '', playerType: 'mobile' }
-                };
-                const state = { segments: 0, bytes: 0, lastSegmentAt: null, lastError: null, stopped: false, timer: null };
-                window.__sdcAudio = state;
-                let playlistUrl = null;
-                const seen = new Set();
-                const resolveUrl = async () => {
-                    const r = await fetch('https://gql.twitch.tv/gql', { method: 'POST', headers, body: JSON.stringify(payload) });
-                    const token = (await r.json())?.data?.streamPlaybackAccessToken;
-                    if (!token?.value || !token?.signature) throw new Error('no playback token');
-                    const u = new URL('https://usher.ttvnw.net/api/channel/hls/' + login + '.m3u8');
-                    u.searchParams.set('allow_audio_only', 'true');
-                    u.searchParams.set('token', token.value);
-                    u.searchParams.set('sig', token.signature);
-                    u.searchParams.set('p', String(Math.floor(Math.random() * 1000000)));
-                    u.searchParams.set('player', 'twitchweb');
-                    u.searchParams.set('type', 'any');
-                    const m = await fetch(u.toString());
-                    const lines = (await m.text()).split('\n');
-                    let found = false;
-                    for (const l of lines) {
-                        if (l.includes('audio_only')) found = true;
-                        if (found && l.startsWith('https://')) return l.trim();
-                    }
-                    throw new Error('no audio_only playlist');
-                };
-                const poll = async () => {
-                    if (state.stopped) return;
-                    try {
-                        if (!playlistUrl) playlistUrl = await resolveUrl();
-                        const res = await fetch(playlistUrl);
-                        if (!res.ok) throw new Error('playlist ' + res.status);
-                        const txt = await res.text();
-                        const urls = txt.split('\n').map(x => x.trim()).filter(x => x.startsWith('https://'));
-                        const fresh = urls.filter(x => !seen.has(x));
-                        fresh.forEach(x => seen.add(x));
-                        for (const seg of fresh.slice(-2)) {
-                            const h = await fetch(seg, { method: 'HEAD' });
-                            if (h.ok) {
-                                state.segments++;
-                                state.bytes += 512;
-                                state.lastSegmentAt = Date.now();
-                            }
-                        }
-                        if (seen.size > 200) [...seen].slice(0, 100).forEach(x => seen.delete(x));
-                    } catch (e) {
-                        state.lastError = String(e.message || e);
-                        playlistUrl = null;
-                    }
-                    state.timer = setTimeout(poll, 10000);
-                };
-                await poll();
-                const playBtn = document.querySelector("button[data-a-target='player-play-pause-button']");
-                if (playBtn && playBtn.getAttribute('data-a-player-state') === 'playing') playBtn.click();
-                return JSON.stringify({ ok: true, segments: state.segments });
-            })();
-        """.trimIndent()
-        evaluateJs(webView, script)
-    }
-
-    suspend fun navigateKickOrigin(accountId: String, sessionToken: String, url: String = "https://kick.com") =
+    suspend fun navigateKickOrigin(
+        accountId: String,
+        sessionToken: String,
+        url: String = "https://kick.com",
+        onlyIfNotOnDomain: Boolean = false
+    ) =
         kickMutex.withLock {
             val webView = kickWebView ?: return@withLock
             activeKickMeterAccountId = accountId
-            withContext(Dispatchers.Main) {
-                applyCookie("https://kick.com", "session_token", sessionToken)
-                val deferred = CompletableDeferred<Unit>()
-                kickPageFinished = deferred
-                webView.loadUrl(url)
-                withTimeoutOrNull(14_000L) { deferred.await() }
+            val currentUrl = withContext(Dispatchers.Main) {
+                webView.resumeTimers()
+                webView.onResume()
+                webView.url.orEmpty()
             }
+            if (onlyIfNotOnDomain && currentUrl.contains("kick.com", ignoreCase = true)) {
+                withContext(Dispatchers.Main) {
+                    applyCookie("https://kick.com", "session_token", sessionToken)
+                }
+                return@withLock
+            }
+
+            val sameStreamUrl = currentUrl.trimEnd('/').equals(url.trimEnd('/'), ignoreCase = true)
+            if (!sameStreamUrl) {
+                withContext(Dispatchers.Main) {
+                    applyCookie("https://kick.com", "session_token", sessionToken)
+                    val deferred = CompletableDeferred<Unit>()
+                    kickPageFinished = deferred
+                    webView.loadUrl(url)
+                    withTimeoutOrNull(14_000L) { deferred.await() }
+                }
+                kotlinx.coroutines.delay(1_200L)
+            }
+
+            // Dismiss 18+/cookie gates, pick lowest quality (160p), mute, and force playback
             evaluateJs(
                 webView,
                 """
                 (() => {
+                    try {
+                        localStorage.setItem('kick_video_quality', '160p');
+                        localStorage.setItem('videoQuality', '160p');
+                    } catch (_) {}
+                    const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
+                    for (const b of btns) {
+                        const t = (b.textContent || '').trim().toLowerCase();
+                        if (t.includes('start watching') || t.includes('18 or older') || t === 'accept' || t.includes('i am 18')) {
+                            b.click();
+                        }
+                    }
+                    const items = Array.from(document.querySelectorAll('[role="menuitemradio"], button'));
+                    const low = items.find(el => /\b160p\b/i.test(el.textContent || ''));
+                    if (low) low.click();
                     const v = document.querySelector('video');
-                    if (v) { v.muted = true; }
+                    if (v) {
+                        v.muted = true;
+                        v.volume = 0;
+                        if (v.paused) v.play().catch(() => {});
+                    }
                     return 'ok';
                 })();
                 """.trimIndent()
@@ -316,7 +303,11 @@ class WebViewMiningBridge {
         val webView = kickWebView ?: return@withLock null
         activeKickMeterAccountId = accountId
 
-        val currentUrl = withContext(Dispatchers.Main) { webView.url.orEmpty() }
+        val currentUrl = withContext(Dispatchers.Main) {
+            webView.resumeTimers()
+            webView.onResume()
+            webView.url.orEmpty()
+        }
         if (!currentUrl.contains("kick.com")) {
             withContext(Dispatchers.Main) {
                 applyCookie("https://kick.com", "session_token", sessionToken)

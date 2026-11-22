@@ -1,13 +1,16 @@
 package com.example
 
 import android.Manifest
+import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.view.ViewGroup
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -15,6 +18,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
@@ -24,6 +29,8 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
@@ -32,6 +39,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.HelpOutline
+import androidx.compose.material.icons.filled.Bedtime
 import androidx.compose.material.icons.filled.Dashboard
 import androidx.compose.material.icons.filled.Inventory2
 import androidx.compose.material.icons.filled.Settings
@@ -49,20 +57,31 @@ import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import kotlinx.coroutines.delay
+import java.time.LocalTime
+import java.time.format.DateTimeFormatter
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.NavDestination.Companion.hasRoute
@@ -149,6 +168,7 @@ private fun DropCollectorRoot(
     val app = context.applicationContext as DropCollectorApp
     val navController = rememberNavController()
     val snackbarHostState = remember { SnackbarHostState() }
+    var isNightScreenActive by rememberSaveable { mutableStateOf(false) }
 
     val notificationLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -335,7 +355,8 @@ private fun DropCollectorRoot(
                                     onRemoveAccount = { id -> viewModel.removeAccount(id) },
                                     onResetNetwork = { id -> viewModel.resetAccountNetwork(id) },
                                     onRefreshAll = { viewModel.refreshAll() },
-                                    onAuthorizeHelix = { viewModel.startHelixAuthorization() }
+                                    onAuthorizeHelix = { viewModel.startHelixAuthorization() },
+                                    onEnterNightScreen = { isNightScreenActive = true }
                                 )
                             }
 
@@ -429,6 +450,113 @@ private fun DropCollectorRoot(
             onOpenActivation = { openExternalUrl(it) },
             onDismiss = { viewModel.dismissHelixPrompt() }
         )
+    }
+
+    if (isNightScreenActive) {
+        NightScreenOverlay(
+            sessions = sessions,
+            onExit = { isNightScreenActive = false }
+        )
+    }
+}
+
+@Composable
+private fun NightScreenOverlay(
+    sessions: List<com.example.core.models.AccountSessionState>,
+    onExit: () -> Unit
+) {
+    val context = LocalContext.current
+    val activity = context as? Activity
+    var clockTick by remember { mutableIntStateOf(0) }
+    var timeString by remember { mutableStateOf(DateTimeFormatter.ofPattern("HH:mm").format(LocalTime.now())) }
+
+    BackHandler(onBack = onExit)
+
+    DisposableEffect(activity) {
+        val window = activity?.window
+        val previousBrightness = window?.attributes?.screenBrightness
+            ?: WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+        window?.let { w ->
+            w.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            w.attributes = w.attributes.apply {
+                screenBrightness = 0.01f
+            }
+        }
+        onDispose {
+            window?.let { w ->
+                w.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                w.attributes = w.attributes.apply {
+                    screenBrightness = previousBrightness
+                }
+            }
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        while (true) {
+            timeString = DateTimeFormatter.ofPattern("HH:mm").format(LocalTime.now())
+            clockTick = (clockTick + 1) % 6
+            delay(30_000L)
+        }
+    }
+
+    val activeMining = sessions.filter { it.account.enabled && it.minerStatus == "Mining" }
+    val driftY = ((clockTick - 2) * 14).dp
+    val driftX = (((clockTick % 3) - 1) * 10).dp
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black)
+            .pointerInput(Unit) {
+                detectTapGestures(onDoubleTap = { onExit() })
+            }
+            .testTag("night_screen_overlay"),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            modifier = Modifier
+                .offset(x = driftX, y = driftY)
+                .padding(32.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Icon(
+                imageVector = Icons.Default.Bedtime,
+                contentDescription = null,
+                tint = Color(0xFF2B6B52),
+                modifier = Modifier.size(28.dp)
+            )
+            Text(
+                text = timeString,
+                fontFamily = JetBrainsMonoFamily,
+                fontSize = 42.sp,
+                fontWeight = FontWeight.Light,
+                color = Color(0xFF4F6B60)
+            )
+            if (activeMining.isEmpty()) {
+                Text(
+                    text = "Standing by • ${sessions.count { it.account.enabled }} account(s)",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Color(0xFF4A4A4A)
+                )
+            } else {
+                activeMining.forEach { s ->
+                    Text(
+                        text = "${s.account.platform.displayName}: ${s.progress.minedChannel} • ${s.progress.dropCaptionText}",
+                        fontFamily = JetBrainsMonoFamily,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = Color(0xFF426356)
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.height(18.dp))
+            Text(
+                text = "Double-tap anywhere to exit AMOLED Night Screen",
+                style = MaterialTheme.typography.labelSmall,
+                color = Color(0xFF333333)
+            )
+        }
     }
 }
 

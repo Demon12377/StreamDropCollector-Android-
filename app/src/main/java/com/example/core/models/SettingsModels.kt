@@ -5,6 +5,7 @@ import kotlinx.serialization.Serializable
 @Serializable
 data class AppSettings(
     val runInBackground: Boolean = true,
+    val overnightBatterySaver: Boolean = true,
     val themeMode: ThemeMode = ThemeMode.DARK,
     val updateFrequency: UpdateFrequency = UpdateFrequency.DAILY,
     val includeBetaUpdates: Boolean = false,

@@ -33,11 +33,14 @@ class MiningEngine(
     private val twitchGqlClient: TwitchGqlClient,
     private val twitchHelixClient: TwitchHelixClient,
     private val kickApiClient: KickApiClient,
-    private val notificationDispatcher: NotificationDispatcher
+    private val notificationDispatcher: NotificationDispatcher,
+    private val headHeartbeat: HeadOnlyStreamHeartbeat = HeadOnlyStreamHeartbeat()
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val _sessions = MutableStateFlow<List<AccountSessionState>>(emptyList())
     val sessions: StateFlow<List<AccountSessionState>> = _sessions.asStateFlow()
+
+    private val accountClientIds = ConcurrentHashMap<String, String>()
 
     private val accountJobs = ConcurrentHashMap<String, Job>()
     private var telemetryJob: Job? = null
@@ -195,9 +198,30 @@ class MiningEngine(
                 }
             }
 
-            // Watch/tick loop for 4 minutes (updating local watch progress every 60s) before next full sync
+            // Watch/tick loop for 4 minutes (pulsing low-power HEAD heartbeats every 20s and updating UI progress every 60s)
             for (minuteTick in 1..4) {
-                delay(60_000L)
+                for (subPulse in 1..3) {
+                    delay(20_000L)
+                    val latestAcc = settingsRepository.getAccounts().firstOrNull { it.id == accountId }
+                    if (latestAcc == null || !latestAcc.enabled) break
+                    val curSettings = settingsRepository.getSettings()
+                    val curEffective = ActiveCampaignFilter.resolveEffectiveSettings(latestAcc, curSettings)
+                    val curSession = _sessions.value.firstOrNull { it.account.id == accountId }
+                    val activeChannel = curSession?.progress?.minedChannel.orEmpty()
+                    if (latestAcc.platform == Platform.TWITCH &&
+                        curSession?.minerStatus == "Mining" &&
+                        activeChannel.isNotBlank() &&
+                        (curEffective.headOnlyMining || curSettings.overnightBatterySaver)
+                    ) {
+                        val clientId = accountClientIds[accountId] ?: creds.clientId.ifBlank { "kimne78kx3ncx6brgo4mv6wki5h1ko" }
+                        headHeartbeat.pulseTwitchChannel(
+                            accountId = accountId,
+                            authToken = creds.authToken,
+                            clientId = clientId,
+                            channelLogin = activeChannel
+                        )
+                    }
+                }
                 val latestAcc = settingsRepository.getAccounts().firstOrNull { it.id == accountId }
                 if (latestAcc == null || !latestAcc.enabled) break
                 advanceLocalProgressOneMinute(accountId)
@@ -275,6 +299,9 @@ class MiningEngine(
             settingsRepository.setPinnedCampaignId(account.id, null)
         }
 
+        val useLowPowerHead = effective.headOnlyMining || globalSettings.overnightBatterySaver
+        accountClientIds[account.id] = headers.clientId
+
         val selectedCampaign = selection.campaign
         var minedChannelLogin = ""
         var minedChannelUrl = ""
@@ -289,9 +316,21 @@ class MiningEngine(
                     accountId = account.id,
                     authToken = creds.authToken,
                     streamUrl = minedChannelUrl,
-                    headOnly = effective.headOnlyMining
+                    headOnly = useLowPowerHead
                 )
+                if (useLowPowerHead) {
+                    headHeartbeat.pulseTwitchChannel(
+                        accountId = account.id,
+                        authToken = creds.authToken,
+                        clientId = headers.clientId,
+                        channelLogin = liveLogin
+                    )
+                }
+            } else {
+                webViewBridge.suspendWebViewForLowPower(Platform.TWITCH)
             }
+        } else {
+            webViewBridge.suspendWebViewForLowPower(Platform.TWITCH)
         }
 
         val markedCampaigns = markCurrentCampaigns(updatedCampaigns, selectedCampaign?.id)
@@ -339,7 +378,7 @@ class MiningEngine(
             )
         }
 
-        webViewBridge.navigateKickOrigin(account.id, creds.authToken)
+        webViewBridge.navigateKickOrigin(account.id, creds.authToken, onlyIfNotOnDomain = true)
         val (_, username) = kickApiClient.fetchUserProfile(account.id, creds.authToken)
         if (!username.isNullOrBlank() && account.displayName != username) {
             val all = settingsRepository.getAccounts().map {
@@ -426,6 +465,9 @@ class MiningEngine(
                     isCurrentCampaign = true
                 )
             }
+        }
+        if (minedChannelLogin.isBlank()) {
+            webViewBridge.suspendWebViewForLowPower(Platform.KICK)
         }
 
         val markedCampaigns = markCurrentCampaigns(updatedCampaigns, selectedCampaign?.id)
