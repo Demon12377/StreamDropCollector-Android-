@@ -168,6 +168,7 @@ class KickApiClient(
             data.forEach { el ->
                 val c = el.jsonObject
                 val category = c["category"] as? JsonObject
+                val catId = category?.get("id")?.jsonPrimitive?.content?.trim()
                 val catSlug = category?.get("slug")?.jsonPrimitive?.content?.trim()?.lowercase().orEmpty()
                 val catName = category?.get("name")?.jsonPrimitive?.content.orEmpty()
                 if (catSlug.isNotBlank() && catName.isNotBlank()) {
@@ -225,6 +226,7 @@ class KickApiClient(
                     id = c["id"]!!.jsonPrimitive.content,
                     name = c["name"]!!.jsonPrimitive.content,
                     slug = catSlug,
+                    gameId = catId,
                     gameName = gameName,
                     gameImageUrl = gameImg,
                     startsAtEpochMs = parseIso(c["starts_at"]?.jsonPrimitive?.content),
@@ -423,26 +425,74 @@ class KickApiClient(
     suspend fun getTopLiveChannels(
         categorySlug: String?,
         accountId: String = "",
-        sessionToken: String = ""
+        sessionToken: String = "",
+        categoryId: String? = null
     ): List<LiveChannelSnapshot> {
-        val url = if (!categorySlug.isNullOrBlank()) {
-            "https://kick.com/stream/livestreams/en?page=1&limit=15&category=${categorySlug.lowercase()}&sort=viewers_high_to_low"
+        val slug = categorySlug?.trim()?.lowercase()?.takeIf { it.isNotBlank() }
+        val candidateUrls = if (slug != null) {
+            buildList {
+                add("https://kick.com/stream/livestreams/en?page=1&limit=15&subcategory=$slug&sort=desc")
+                add("https://kick.com/stream/livestreams?page=1&limit=15&subcategory=$slug&sort=desc")
+                add("https://kick.com/stream/livestreams/en?page=1&limit=15&subcategory=$slug")
+                if (!categoryId.isNullOrBlank()) {
+                    add("https://kick.com/stream/livestreams/en?page=1&limit=15&subcategory_id=$categoryId&sort=desc")
+                }
+            }
         } else {
-            "https://kick.com/stream/livestreams/en?page=1&limit=15&sort=viewers_high_to_low"
+            listOf(
+                "https://kick.com/stream/livestreams/en?page=1&limit=15&sort=desc",
+                "https://kick.com/stream/livestreams/en?page=1&limit=15",
+                "https://kick.com/stream/featured-livestreams/en"
+            )
         }
-        val body = fetchPublicOrKickWebView(url, accountId, sessionToken) ?: return emptyList()
+
+        for (url in candidateUrls) {
+            val body = fetchPublicOrKickWebView(url, accountId, sessionToken) ?: continue
+            val parsed = parseLivestreamDirectory(body)
+            if (parsed.isNotEmpty()) {
+                return parsed
+            }
+        }
+
+        if (slug != null && accountId.isNotBlank()) {
+            val scrapedSlugs = webViewBridge.scrapeKickCategoryDropsChannels(accountId, sessionToken, slug)
+            for (cand in scrapedSlugs.take(6)) {
+                val snap = getChannelLiveSnapshot(cand, accountId, sessionToken)
+                if (snap?.isLive == true &&
+                    (snap.gameSlug.isNullOrBlank() || snap.gameSlug.equals(slug, ignoreCase = true))
+                ) {
+                    return listOf(snap)
+                }
+            }
+        }
+        return emptyList()
+    }
+
+    private fun parseLivestreamDirectory(body: String): List<LiveChannelSnapshot> {
         return runCatching {
-            val root = json.parseToJsonElement(body).jsonObject
-            val data = root["data"]?.jsonArray ?: return@runCatching emptyList()
+            val rootEl = json.parseToJsonElement(body)
+            val data = when {
+                rootEl is JsonArray -> rootEl
+                rootEl is JsonObject -> rootEl["data"]?.jsonArray ?: rootEl["livestreams"]?.jsonArray ?: return@runCatching emptyList()
+                else -> return@runCatching emptyList()
+            }
             data.mapNotNull { el ->
                 val obj = el.jsonObject
-                val channel = obj["channel"]?.jsonObject ?: return@mapNotNull null
-                val slug = channel["slug"]?.jsonPrimitive?.content ?: return@mapNotNull null
+                val channel = obj["channel"]?.jsonObject
+                val slug = channel?.get("slug")?.jsonPrimitive?.content
+                    ?: obj["slug"]?.jsonPrimitive?.content
+                    ?: return@mapNotNull null
+                val username = channel?.get("user")?.jsonObject?.get("username")?.jsonPrimitive?.content
+                    ?: obj["user"]?.jsonObject?.get("username")?.jsonPrimitive?.content
+                    ?: slug
+                val category = obj["categories"]?.jsonArray?.firstOrNull()?.jsonObject
                 LiveChannelSnapshot(
                     login = slug.lowercase(),
-                    displayName = channel["user"]?.jsonObject?.get("username")?.jsonPrimitive?.content ?: slug,
+                    displayName = username,
                     isLive = true,
                     viewerCount = obj["viewer_count"]?.jsonPrimitive?.intOrNull ?: 0,
+                    gameName = category?.get("name")?.jsonPrimitive?.content,
+                    gameSlug = category?.get("slug")?.jsonPrimitive?.content,
                     title = obj["session_title"]?.jsonPrimitive?.content
                 )
             }
@@ -469,7 +519,7 @@ class KickApiClient(
                     val text = resp.body?.string().orEmpty()
                     if (resp.isSuccessful) text to resp.code
                     else {
-                        AppLogger.warn("KickPublic", "GET $url -> HTTP ${resp.code}")
+                        AppLogger.warn("KickPublic", "GET $url -> HTTP ${resp.code}: ${text.take(140)}")
                         null to resp.code
                     }
                 }

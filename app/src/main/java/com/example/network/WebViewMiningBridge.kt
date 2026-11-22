@@ -268,41 +268,71 @@ class WebViewMiningBridge {
                     webView.loadUrl(url)
                     withTimeoutOrNull(14_000L) { deferred.await() }
                 }
-                kotlinx.coroutines.delay(1_200L)
+                kotlinx.coroutines.delay(1_500L)
             }
 
-            // Dismiss 18+/cookie gates, pick lowest quality (160p), mute, and force playback
-            val playRes = evaluateJs(
-                webView,
-                """
-                (() => {
-                    try {
-                        localStorage.setItem('kick_video_quality', '160p');
-                        localStorage.setItem('videoQuality', '160p');
-                    } catch (_) {}
-                    const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
-                    for (const b of btns) {
-                        const t = (b.textContent || '').trim().toLowerCase();
-                        if (t.includes('start watching') || t.includes('18 or older') || t === 'accept' || t.includes('i am 18')) {
-                            b.click();
-                        }
-                    }
-                    const items = Array.from(document.querySelectorAll('[role="menuitemradio"], button'));
-                    const low = items.find(el => /\b160p\b/i.test(el.textContent || ''));
-                    if (low) low.click();
-                    const v = document.querySelector('video');
-                    if (v) {
-                        v.muted = true;
-                        v.volume = 0;
-                        if (v.paused) v.play().catch(() => {});
-                        return 'video:' + (v.paused ? 'paused' : 'playing');
-                    }
-                    return 'no-video';
-                })();
-                """.trimIndent()
-            )
+            var playRes: String? = null
+            // Poll briefly so slower mobile CPUs finish mounting Kick's React video player
+            for (attempt in 1..4) {
+                playRes = applyKickLowestQualityScript(webView)
+                if (playRes?.contains("video:playing") == true) break
+                kotlinx.coroutines.delay(900L)
+            }
             AppLogger.info("KickWebView", "Opened $url -> $playRes")
         }
+
+    suspend fun nudgeKickPlayerLowQuality() = kickMutex.withLock {
+        val webView = kickWebView ?: return@withLock
+        val currentUrl = withContext(Dispatchers.Main) { webView.url.orEmpty() }
+        if (!currentUrl.contains("kick.com", ignoreCase = true)) return@withLock
+        val res = applyKickLowestQualityScript(webView)
+        if (res?.contains("paused") == true || res?.contains("no-video") == true) {
+            AppLogger.debug("KickWebView", "Playback nudge on $currentUrl -> $res")
+        }
+    }
+
+    private suspend fun applyKickLowestQualityScript(webView: WebView): String? =
+        evaluateJs(
+            webView,
+            """
+            (() => {
+                try {
+                    localStorage.setItem('kick_video_quality', '160p');
+                    localStorage.setItem('videoQuality', '160p');
+                    localStorage.setItem('quality', '160p');
+                } catch (_) {}
+                const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
+                for (const b of btns) {
+                    const t = (b.textContent || '').trim().toLowerCase();
+                    if (t.includes('start watching') || t.includes('18 or older') || t === 'accept' || t.includes('i am 18')) {
+                        b.click();
+                    }
+                }
+                const v = document.querySelector('video');
+                const needsLowerQuality = !v || !v.videoHeight || v.videoHeight > 240;
+                if (needsLowerQuality) {
+                    const gear = document.querySelector(
+                        'button[aria-label*="quality" i], button[aria-label*="settings" i], button[data-testid*="quality" i], button[data-testid*="settings" i]'
+                    );
+                    const hasMenu = document.querySelector('[role="menuitemradio"]');
+                    if (gear && !hasMenu) gear.click();
+                    const candidates = Array.from(document.querySelectorAll('[role="menuitemradio"], [role="option"], button, li'));
+                    const low = ['160p', '240p', '360p']
+                        .map(q => candidates.find(el => new RegExp('\\b' + q + '\\b', 'i').test(el.textContent || '')))
+                        .find(Boolean);
+                    if (low) low.click();
+                }
+                if (v) {
+                    v.muted = true;
+                    v.volume = 0;
+                    if (v.paused) v.play().catch(() => {});
+                    const qLabel = v.videoHeight ? (v.videoHeight + 'p') : 'auto';
+                    return 'video:' + (v.paused ? 'paused' : 'playing') + '@' + qLabel;
+                }
+                return 'no-video';
+            })();
+            """.trimIndent()
+        )
 
     suspend fun executeKickFetch(
         accountId: String,
@@ -385,6 +415,72 @@ class WebViewMiningBridge {
         }
         AppLogger.warn("KickWebView", "$method $url timed out in WebView fetch")
         null
+    }
+
+    suspend fun scrapeKickCategoryDropsChannels(
+        accountId: String,
+        sessionToken: String,
+        categorySlug: String
+    ): List<String> = kickMutex.withLock {
+        val webView = kickWebView ?: return@withLock emptyList()
+        activeKickMeterAccountId = accountId
+
+        val urlsToTry = listOf(
+            "https://kick.com/category/${categorySlug.lowercase()}/drops",
+            "https://kick.com/category/${categorySlug.lowercase()}"
+        )
+        val reserved = setOf(
+            "browse", "category", "categories", "drops", "following", "subscriptions",
+            "transactions", "dashboard", "settings", "search", "login", "signup",
+            "terms", "privacy", "dmca", "help", "about", "video", "clips", "api"
+        )
+
+        for (targetUrl in urlsToTry) {
+            withContext(Dispatchers.Main) {
+                webView.resumeTimers()
+                webView.onResume()
+                applyCookie("https://kick.com", "session_token", sessionToken)
+                val deferred = CompletableDeferred<Unit>()
+                kickPageFinished = deferred
+                webView.loadUrl(targetUrl)
+                withTimeoutOrNull(12_000L) { deferred.await() }
+            }
+            kotlinx.coroutines.delay(2_000L)
+
+            val raw = evaluateJs(
+                webView,
+                """
+                (() => {
+                    const out = [];
+                    const seen = new Set();
+                    const anchors = Array.from(document.querySelectorAll('a[href^="/"]'));
+                    for (const a of anchors) {
+                        const href = (a.getAttribute('href') || '').split('?')[0].trim();
+                        if (/^\/[a-zA-Z0-9_-]{2,32}$/.test(href)) {
+                            const slug = href.slice(1).toLowerCase();
+                            if (!seen.has(slug)) {
+                                seen.add(slug);
+                                out.push(slug);
+                            }
+                        }
+                    }
+                    return out.slice(0, 20).join(',');
+                })();
+                """.trimIndent()
+            )
+            val cleaned = raw?.trim('"', ' ', '\n').orEmpty()
+            if (cleaned.isNotBlank() && cleaned != "null") {
+                val slugs = cleaned.split(',')
+                    .map { it.trim().lowercase() }
+                    .filter { it.isNotBlank() && it !in reserved }
+                    .distinct()
+                if (slugs.isNotEmpty()) {
+                    AppLogger.info("KickWebView", "Directory $targetUrl found ${slugs.size} channel candidates")
+                    return@withLock slugs
+                }
+            }
+        }
+        emptyList()
     }
 
     private suspend fun evaluateJs(webView: WebView, script: String): String? =

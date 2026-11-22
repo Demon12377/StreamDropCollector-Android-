@@ -17,72 +17,91 @@ object CampaignPrioritizer {
         prioritizeBadges: Boolean = false,
         gamePriority: List<String>? = null
     ): CampaignSelectionResult {
+        val ranked = rankCandidates(
+            campaigns = campaigns,
+            pinnedCampaignId = pinnedCampaignId,
+            mode = mode,
+            prioritizeBadges = prioritizeBadges,
+            gamePriority = gamePriority
+        )
+        return CampaignSelectionResult(
+            campaign = ranked.campaigns.firstOrNull(),
+            pinReleased = ranked.pinReleased
+        )
+    }
+
+    data class RankedCampaignsResult(
+        val campaigns: List<DropsCampaign>,
+        val pinReleased: Boolean
+    )
+
+    fun rankCandidates(
+        campaigns: List<DropsCampaign>,
+        pinnedCampaignId: String?,
+        mode: MiningPriorityMode,
+        prioritizeBadges: Boolean = false,
+        gamePriority: List<String>? = null
+    ): RankedCampaignsResult {
         if (campaigns.isEmpty()) {
-            return CampaignSelectionResult(null, pinReleased = pinnedCampaignId != null)
+            return RankedCampaignsResult(emptyList(), pinReleased = pinnedCampaignId != null)
         }
 
+        val orderedAll = sortAllByPriority(campaigns, mode, prioritizeBadges, gamePriority)
         if (!pinnedCampaignId.isNullOrBlank()) {
             val pinned = campaigns.firstOrNull { it.id == pinnedCampaignId }
             if (pinned != null) {
-                return CampaignSelectionResult(pinned, pinReleased = false)
+                val rest = orderedAll.filterNot { it.id == pinned.id }
+                return RankedCampaignsResult(listOf(pinned) + rest, pinReleased = false)
             }
-            val narrowed = topPriorityGame(campaigns, gamePriority)
-            return CampaignSelectionResult(selectByPriority(narrowed, mode, prioritizeBadges), pinReleased = true)
+            return RankedCampaignsResult(orderedAll, pinReleased = true)
         }
 
-        val narrowed = topPriorityGame(campaigns, gamePriority)
-        return CampaignSelectionResult(selectByPriority(narrowed, mode, prioritizeBadges), pinReleased = false)
+        return RankedCampaignsResult(orderedAll, pinReleased = false)
     }
 
-    private fun topPriorityGame(campaigns: List<DropsCampaign>, gamePriority: List<String>?): List<DropsCampaign> {
-        if (gamePriority.isNullOrEmpty() || campaigns.isEmpty()) return campaigns
-
-        fun rank(c: DropsCampaign): Int {
+    private fun sortAllByPriority(
+        campaigns: List<DropsCampaign>,
+        mode: MiningPriorityMode,
+        prioritizeBadges: Boolean,
+        gamePriority: List<String>?
+    ): List<DropsCampaign> {
+        fun gameRank(c: DropsCampaign): Int {
+            if (gamePriority.isNullOrEmpty()) return 0
             val slug = c.slug.trim()
             val idx = gamePriority.indexOfFirst { it.equals(slug, ignoreCase = true) }
             return if (idx >= 0) idx else Int.MAX_VALUE
         }
 
-        val bestRank = campaigns.minOf(::rank)
-        return campaigns.filter { rank(it) == bestRank }
-    }
-
-    private fun selectByPriority(
-        campaigns: List<DropsCampaign>,
-        mode: MiningPriorityMode,
-        prioritizeBadges: Boolean
-    ): DropsCampaign? {
         fun minRemaining(c: DropsCampaign): Int =
             c.rewards.filter { !it.isClaimed }.minOfOrNull { (it.requiredMinutes - it.progressMinutes).coerceAtLeast(0) } ?: Int.MAX_VALUE
 
-        val sorted = when (mode) {
-            MiningPriorityMode.ENDING_SOONEST -> campaigns.sortedWith(
-                compareBy<DropsCampaign> { it.isRewardCampaign }
-                    .thenBy { it.endsAtEpochMs }
-                    .thenBy { minRemaining(it) }
-            )
-            MiningPriorityMode.LEAST_TIME_TO_NEXT_REWARD -> campaigns.sortedWith(
-                compareBy<DropsCampaign> { it.isRewardCampaign }
-                    .thenBy { it.isGeneralDrop }
-                    .thenBy { minRemaining(it) }
-                    .thenByDescending { it.completionPercentage }
-            )
-            MiningPriorityMode.HIGHEST_COMPLETION -> campaigns.sortedWith(
-                compareBy<DropsCampaign> { it.isRewardCampaign }
-                    .thenBy { it.isGeneralDrop }
-                    .thenByDescending { it.completionPercentage }
-                    .thenBy { it.endsAtEpochMs }
-                    .thenBy { minRemaining(it) }
-            )
-            MiningPriorityMode.AVAILABILITY_THEN_PROGRESS -> campaigns.sortedWith(
-                compareBy<DropsCampaign> { it.isRewardCampaign }
-                    .thenBy { it.isGeneralDrop }
-                    .thenByDescending { it.completionPercentage }
-                    .thenBy { minRemaining(it) }
-            )
+        val baseComparator = when (mode) {
+            MiningPriorityMode.ENDING_SOONEST -> compareBy<DropsCampaign> { gameRank(it) }
+                .thenBy { it.isRewardCampaign }
+                .thenBy { it.endsAtEpochMs }
+                .thenBy { minRemaining(it) }
+            MiningPriorityMode.LEAST_TIME_TO_NEXT_REWARD -> compareBy<DropsCampaign> { gameRank(it) }
+                .thenBy { it.isRewardCampaign }
+                .thenBy { it.isGeneralDrop }
+                .thenBy { minRemaining(it) }
+                .thenByDescending { it.completionPercentage }
+            MiningPriorityMode.HIGHEST_COMPLETION -> compareBy<DropsCampaign> { gameRank(it) }
+                .thenBy { it.isRewardCampaign }
+                .thenBy { it.isGeneralDrop }
+                .thenByDescending { it.completionPercentage }
+                .thenBy { it.endsAtEpochMs }
+                .thenBy { minRemaining(it) }
+            MiningPriorityMode.AVAILABILITY_THEN_PROGRESS -> compareBy<DropsCampaign> { gameRank(it) }
+                .thenBy { it.isRewardCampaign }
+                .thenBy { it.isGeneralDrop }
+                .thenByDescending { it.completionPercentage }
+                .thenBy { minRemaining(it) }
         }
 
-        val badgePick = if (prioritizeBadges) sorted.firstOrNull { it.hasUnclaimedBadge } else null
-        return badgePick ?: sorted.firstOrNull()
+        val sorted = campaigns.sortedWith(baseComparator)
+        if (!prioritizeBadges) return sorted
+        val withBadges = sorted.filter { it.hasUnclaimedBadge }
+        val withoutBadges = sorted.filterNot { it.hasUnclaimedBadge }
+        return withBadges + withoutBadges
     }
 }

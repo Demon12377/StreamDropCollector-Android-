@@ -198,12 +198,16 @@ class MiningEngine(
                 }
             }
 
-            // Watch/tick loop for 4 minutes (pulsing low-power HEAD heartbeats every 20s and updating UI progress every 60s)
+            // Watch/tick loop for 4 minutes (pulsing low-power HEAD heartbeats every 20s and checking Kick failover every 60s)
+            var breakEarlyForFailover = false
             for (minuteTick in 1..4) {
                 for (subPulse in 1..3) {
                     delay(20_000L)
                     val latestAcc = settingsRepository.getAccounts().firstOrNull { it.id == accountId }
-                    if (latestAcc == null || !latestAcc.enabled) break
+                    if (latestAcc == null || !latestAcc.enabled) {
+                        breakEarlyForFailover = true
+                        break
+                    }
                     val curSettings = settingsRepository.getSettings()
                     val curEffective = ActiveCampaignFilter.resolveEffectiveSettings(latestAcc, curSettings)
                     val curSession = _sessions.value.firstOrNull { it.account.id == accountId }
@@ -222,9 +226,40 @@ class MiningEngine(
                         )
                     }
                 }
-                val latestAcc = settingsRepository.getAccounts().firstOrNull { it.id == accountId }
-                if (latestAcc == null || !latestAcc.enabled) break
+                if (breakEarlyForFailover) break
+
+                val latestAcc = settingsRepository.getAccounts().firstOrNull { it.id == accountId } ?: break
+                if (!latestAcc.enabled) break
                 advanceLocalProgressOneMinute(accountId)
+
+                // Fast failover check for Kick every 60s: switch immediately if streamer went offline or changed game
+                val curSession = _sessions.value.firstOrNull { it.account.id == accountId }
+                val activeChannel = curSession?.progress?.minedChannel.orEmpty()
+                if (latestAcc.platform == Platform.KICK &&
+                    curSession?.minerStatus == "Mining" &&
+                    activeChannel.isNotBlank() &&
+                    minuteTick < 4
+                ) {
+                    val activeCamp = curSession.campaigns.firstOrNull { it.isCurrentCampaign }
+                    val snap = kickApiClient.getChannelLiveSnapshot(activeChannel, accountId, creds.authToken)
+                    val wentOffline = snap != null && !snap.isLive
+                    val changedGame = activeCamp != null &&
+                        activeCamp.acceptsAnyChannel &&
+                        activeCamp.slug.isNotBlank() &&
+                        snap?.isLive == true &&
+                        !snap.gameSlug.isNullOrBlank() &&
+                        !snap.gameSlug.equals(activeCamp.slug, ignoreCase = true)
+
+                    if (wentOffline || changedGame) {
+                        AppLogger.warn(
+                            "Kick",
+                            "Channel $activeChannel ${if (wentOffline) "went offline" else "switched category (${snap?.gameSlug})"}; switching streamer now"
+                        )
+                        break
+                    } else {
+                        webViewBridge.nudgeKickPlayerLowQuality()
+                    }
+                }
             }
         }
     }
@@ -289,30 +324,32 @@ class MiningEngine(
             .filter { it.hasProgressToMake(effective.autoClaimRewards) }
 
         val pinnedId = settingsRepository.getPinnedCampaignId(account.id)
-        val selection = CampaignPrioritizer.selectBest(
+        val ranked = CampaignPrioritizer.rankCandidates(
             campaigns = filteredForMining,
             pinnedCampaignId = pinnedId,
             mode = effective.miningPriorityMode,
             prioritizeBadges = effective.prioritizeBadges,
             gamePriority = effective.gameWhitelistSlugs
         )
-        if (selection.pinReleased) {
+        if (ranked.pinReleased) {
             settingsRepository.setPinnedCampaignId(account.id, null)
         }
 
         val useLowPowerHead = effective.headOnlyMining || globalSettings.overnightBatterySaver
         accountClientIds[account.id] = headers.clientId
 
-        val selectedCampaign = selection.campaign
+        var selectedCampaign = ranked.campaigns.firstOrNull()
         var minedChannelLogin = ""
         var minedChannelUrl = ""
 
-        if (selectedCampaign != null) {
-            val liveLogin = pickBestTwitchStreamer(selectedCampaign, effective.priorityStreamers, account.id)
+        for (candCamp in ranked.campaigns) {
+            val liveLogin = pickBestTwitchStreamer(candCamp, effective.priorityStreamers, account.id)
             if (liveLogin != null) {
+                selectedCampaign = candCamp
                 minedChannelLogin = liveLogin
                 minedChannelUrl = "https://www.twitch.tv/$liveLogin"
                 settingsRepository.setLastMinedStreamer(account.id, liveLogin)
+                AppLogger.info("Twitch", "Selected channel $minedChannelLogin for campaign '${candCamp.name}'")
                 webViewBridge.navigateAndPrepareTwitchStream(
                     accountId = account.id,
                     authToken = creds.authToken,
@@ -327,10 +364,12 @@ class MiningEngine(
                         channelLogin = liveLogin
                     )
                 }
+                break
             } else {
-                webViewBridge.suspendWebViewForLowPower(Platform.TWITCH)
+                AppLogger.warn("Twitch", "No live eligible streamer for campaign '${candCamp.name}'")
             }
-        } else {
+        }
+        if (minedChannelLogin.isBlank()) {
             webViewBridge.suspendWebViewForLowPower(Platform.TWITCH)
         }
 
@@ -360,7 +399,7 @@ class MiningEngine(
                 minerStatus = if (minedChannelLogin.isNotBlank()) "Mining" else "Idle",
                 campaigns = regularCampaigns,
                 rewardCampaigns = rewardCampaigns,
-                pinnedCampaignId = if (selection.pinReleased) null else pinnedId,
+                pinnedCampaignId = if (ranked.pinReleased) null else pinnedId,
                 lastSyncEpochMs = System.currentTimeMillis()
             )
         }
@@ -425,31 +464,38 @@ class MiningEngine(
             .filter { it.hasProgressToMake(effective.autoClaimRewards) }
 
         val pinnedId = settingsRepository.getPinnedCampaignId(account.id)
-        val selection = CampaignPrioritizer.selectBest(
+        val ranked = CampaignPrioritizer.rankCandidates(
             campaigns = filteredForMining,
             pinnedCampaignId = pinnedId,
             mode = effective.miningPriorityMode,
             prioritizeBadges = effective.prioritizeBadges,
             gamePriority = effective.gameWhitelistSlugs
         )
-        if (selection.pinReleased) {
+        if (ranked.pinReleased) {
             settingsRepository.setPinnedCampaignId(account.id, null)
         }
+        AppLogger.info("Kick", "Eligible campaigns after filters=${ranked.campaigns.size}")
 
-        var selectedCampaign = selection.campaign
+        var selectedCampaign = ranked.campaigns.firstOrNull()
         var minedChannelLogin = ""
         var minedChannelUrl = ""
 
-        if (selectedCampaign != null) {
-            val liveLogin = pickBestKickStreamer(selectedCampaign, effective.priorityStreamers, account.id, creds.authToken)
+        for (candCamp in ranked.campaigns) {
+            AppLogger.info(
+                "Kick",
+                "Checking campaign '${candCamp.name}' (slug=${candCamp.slug.ifBlank { "any" }}, channels=${candCamp.eligibleStreamers.size}, general=${candCamp.isGeneralDrop})"
+            )
+            val liveLogin = pickBestKickStreamer(candCamp, effective.priorityStreamers, account.id, creds.authToken)
             if (liveLogin != null) {
+                selectedCampaign = candCamp
                 minedChannelLogin = liveLogin
                 minedChannelUrl = "https://kick.com/$liveLogin"
                 settingsRepository.setLastMinedStreamer(account.id, liveLogin)
-                AppLogger.info("Kick", "Selected channel $minedChannelLogin for campaign '${selectedCampaign.name}'")
+                AppLogger.info("Kick", "Selected channel $minedChannelLogin for campaign '${candCamp.name}'")
                 webViewBridge.navigateKickOrigin(account.id, creds.authToken, minedChannelUrl)
+                break
             } else {
-                AppLogger.warn("Kick", "No live eligible streamer found for campaign '${selectedCampaign.name}'")
+                AppLogger.warn("Kick", "No live eligible streamer found for campaign '${candCamp.name}'")
             }
         }
 
@@ -523,7 +569,7 @@ class MiningEngine(
                 },
                 minerStatus = if (minedChannelLogin.isNotBlank()) "Mining" else "Idle",
                 campaigns = markedCampaigns,
-                pinnedCampaignId = if (selection.pinReleased) null else pinnedId,
+                pinnedCampaignId = if (ranked.pinReleased) null else pinnedId,
                 lastSyncEpochMs = System.currentTimeMillis()
             )
         }
@@ -623,19 +669,42 @@ class MiningEngine(
         sessionToken: String
     ): String? {
         val last = settingsRepository.getLastMinedStreamer(accountId)
-        val candidates = (priorityStreamers + listOfNotNull(last) + campaign.eligibleStreamers.map { it.login })
-            .map { it.lowercase() }
-            .distinct()
+        val specificStreamers = campaign.eligibleStreamers.map { it.login.lowercase() }
+        val candidates = if (specificStreamers.isNotEmpty() || campaign.acceptsAnyChannel) {
+            val orderedPrefs = if (specificStreamers.isNotEmpty()) {
+                // Only prefer priority/last streamers that belong to this campaign (unless general drop)
+                val allowed = if (campaign.acceptsAnyChannel) priorityStreamers + listOfNotNull(last)
+                else (priorityStreamers + listOfNotNull(last)).filter { it.lowercase() in specificStreamers }
+                allowed + specificStreamers
+            } else {
+                priorityStreamers + listOfNotNull(last)
+            }
+            orderedPrefs.map { it.lowercase() }.distinct()
+        } else {
+            emptyList()
+        }
 
         for (login in candidates) {
             val snap = kickApiClient.getChannelLiveSnapshot(login, accountId, sessionToken)
-            if (snap?.isLive == true) return snap.login
+            if (snap?.isLive == true) {
+                if (campaign.acceptsAnyChannel && campaign.slug.isNotBlank() &&
+                    !snap.gameSlug.isNullOrBlank() && !snap.gameSlug.equals(campaign.slug, ignoreCase = true)
+                ) {
+                    continue
+                }
+                return snap.login
+            }
         }
-        if (campaign.acceptsAnyChannel && campaign.slug.isNotBlank()) {
-            val top = kickApiClient.getTopLiveChannels(campaign.slug, accountId, sessionToken).firstOrNull()
+        if (campaign.acceptsAnyChannel) {
+            val top = kickApiClient.getTopLiveChannels(
+                categorySlug = campaign.slug.ifBlank { null },
+                accountId = accountId,
+                sessionToken = sessionToken,
+                categoryId = campaign.gameId
+            ).firstOrNull()
             if (top != null) return top.login
         }
-        return campaign.eligibleStreamers.firstOrNull()?.login
+        return null
     }
 
     private fun markCurrentCampaigns(campaigns: List<DropsCampaign>, currentId: String?): List<DropsCampaign> {
