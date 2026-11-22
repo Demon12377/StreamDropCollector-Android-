@@ -241,6 +241,7 @@ class MiningEngine(
                 statusText = "Syncing Twitch drops..."
             )
         }
+        AppLogger.info("Twitch", "Syncing Twitch drops for ${account.displayName}")
 
         val headers = webViewBridge.captureTwitchHeaders(account.id, creds.authToken)
             ?: CapturedTwitchHeaders(
@@ -377,8 +378,8 @@ class MiningEngine(
                 statusText = "Syncing Kick drops..."
             )
         }
+        AppLogger.info("Kick", "Starting Kick sync for ${account.displayName}")
 
-        webViewBridge.navigateKickOrigin(account.id, creds.authToken, onlyIfNotOnDomain = true)
         val (_, username) = kickApiClient.fetchUserProfile(account.id, creds.authToken)
         if (!username.isNullOrBlank() && account.displayName != username) {
             val all = settingsRepository.getAccounts().map {
@@ -388,6 +389,10 @@ class MiningEngine(
         }
 
         val fetched = kickApiClient.fetchActiveCampaigns(account.id, creds.authToken)
+        AppLogger.info(
+            "Kick",
+            "Profile=${username ?: "(unknown)"} • API reachable=${fetched.apiReachable} • Active campaigns=${fetched.campaigns.size}"
+        )
         if (fetched.knownGames.isNotEmpty()) {
             settingsRepository.mergeKnownGames(fetched.knownGames)
         }
@@ -436,21 +441,25 @@ class MiningEngine(
         var minedChannelUrl = ""
 
         if (selectedCampaign != null) {
-            val liveLogin = pickBestKickStreamer(selectedCampaign, effective.priorityStreamers, account.id)
+            val liveLogin = pickBestKickStreamer(selectedCampaign, effective.priorityStreamers, account.id, creds.authToken)
             if (liveLogin != null) {
                 minedChannelLogin = liveLogin
                 minedChannelUrl = "https://kick.com/$liveLogin"
                 settingsRepository.setLastMinedStreamer(account.id, liveLogin)
+                AppLogger.info("Kick", "Selected channel $minedChannelLogin for campaign '${selectedCampaign.name}'")
                 webViewBridge.navigateKickOrigin(account.id, creds.authToken, minedChannelUrl)
+            } else {
+                AppLogger.warn("Kick", "No live eligible streamer found for campaign '${selectedCampaign.name}'")
             }
         }
 
         // Kick level farming fallback
         if (minedChannelLogin.isBlank() && effective.kickLevelFarming) {
-            val top = kickApiClient.getTopLiveChannels(null).firstOrNull()
+            val top = kickApiClient.getTopLiveChannels(null, account.id, creds.authToken).firstOrNull()
             if (top != null) {
                 minedChannelLogin = top.login
                 minedChannelUrl = "https://kick.com/${top.login}"
+                AppLogger.info("Kick", "Level farming fallback -> $minedChannelLogin")
                 webViewBridge.navigateKickOrigin(account.id, creds.authToken, minedChannelUrl)
                 selectedCampaign = DropsCampaign(
                     id = "kick-level-farming",
@@ -491,18 +500,27 @@ class MiningEngine(
             dailyRewardText = dailyText
         )
 
+        val apiBlocked = !fetched.apiReachable && username.isNullOrBlank()
         updateSession(account.id) {
             it.copy(
                 account = if (!username.isNullOrBlank()) it.account.copy(displayName = username) else it.account,
                 connection = PlatformConnectionState(
                     platform = Platform.KICK,
-                    status = ConnectionStatus.ONLINE,
+                    status = if (apiBlocked) ConnectionStatus.ERROR else ConnectionStatus.ONLINE,
                     loginButtonText = "Relogin",
-                    isLoggedIn = true
+                    isLoggedIn = !apiBlocked
                 ),
                 progress = progressState,
-                statusText = if (minedChannelLogin.isNotBlank()) "Mining $minedChannelLogin" else "Idle",
-                statusDetails = selectedCampaign?.name ?: "No eligible Kick drops",
+                statusText = when {
+                    minedChannelLogin.isNotBlank() -> "Mining $minedChannelLogin"
+                    apiBlocked -> "Kick API blocked / relogin needed"
+                    else -> "Idle"
+                },
+                statusDetails = when {
+                    selectedCampaign != null -> selectedCampaign.name
+                    apiBlocked -> "Open Settings → View Diagnostic Logs for HTTP status"
+                    else -> "No eligible Kick drops"
+                },
                 minerStatus = if (minedChannelLogin.isNotBlank()) "Mining" else "Idle",
                 campaigns = markedCampaigns,
                 pinnedCampaignId = if (selection.pinReleased) null else pinnedId,
@@ -601,7 +619,8 @@ class MiningEngine(
     private suspend fun pickBestKickStreamer(
         campaign: DropsCampaign,
         priorityStreamers: List<String>,
-        accountId: String
+        accountId: String,
+        sessionToken: String
     ): String? {
         val last = settingsRepository.getLastMinedStreamer(accountId)
         val candidates = (priorityStreamers + listOfNotNull(last) + campaign.eligibleStreamers.map { it.login })
@@ -609,11 +628,11 @@ class MiningEngine(
             .distinct()
 
         for (login in candidates) {
-            val snap = kickApiClient.getChannelLiveSnapshot(login)
+            val snap = kickApiClient.getChannelLiveSnapshot(login, accountId, sessionToken)
             if (snap?.isLive == true) return snap.login
         }
         if (campaign.acceptsAnyChannel && campaign.slug.isNotBlank()) {
-            val top = kickApiClient.getTopLiveChannels(campaign.slug).firstOrNull()
+            val top = kickApiClient.getTopLiveChannels(campaign.slug, accountId, sessionToken).firstOrNull()
             if (top != null) return top.login
         }
         return campaign.eligibleStreamers.firstOrNull()?.login

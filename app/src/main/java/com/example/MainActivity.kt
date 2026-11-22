@@ -82,7 +82,14 @@ import androidx.compose.ui.viewinterop.AndroidView
 import kotlinx.coroutines.delay
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.ui.platform.LocalView
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.NavDestination.Companion.hasRoute
 import androidx.navigation.NavGraph.Companion.findStartDestination
@@ -466,96 +473,116 @@ private fun NightScreenOverlay(
     onExit: () -> Unit
 ) {
     val context = LocalContext.current
+    val view = LocalView.current
     val activity = context as? Activity
-    var clockTick by remember { mutableIntStateOf(0) }
+    var showHud by remember { mutableStateOf(true) }
+    var peekTrigger by remember { mutableIntStateOf(0) }
     var timeString by remember { mutableStateOf(DateTimeFormatter.ofPattern("HH:mm").format(LocalTime.now())) }
 
     BackHandler(onBack = onExit)
 
-    DisposableEffect(activity) {
+    DisposableEffect(activity, view) {
         val window = activity?.window
         val previousBrightness = window?.attributes?.screenBrightness
             ?: WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+        val previousCutoutMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            window?.attributes?.layoutInDisplayCutoutMode ?: WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_DEFAULT
+        } else 0
+
         window?.let { w ->
             w.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             w.attributes = w.attributes.apply {
-                screenBrightness = 0.01f
+                screenBrightness = 0.001f
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                }
             }
+            val controller = WindowCompat.getInsetsController(w, view)
+            controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            controller.hide(WindowInsetsCompat.Type.systemBars())
         }
         onDispose {
             window?.let { w ->
                 w.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                 w.attributes = w.attributes.apply {
                     screenBrightness = previousBrightness
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                        layoutInDisplayCutoutMode = previousCutoutMode
+                    }
                 }
+                WindowCompat.getInsetsController(w, view).show(WindowInsetsCompat.Type.systemBars())
             }
         }
     }
 
-    LaunchedEffect(Unit) {
-        while (true) {
-            timeString = DateTimeFormatter.ofPattern("HH:mm").format(LocalTime.now())
-            clockTick = (clockTick + 1) % 6
-            delay(30_000L)
-        }
+    LaunchedEffect(peekTrigger) {
+        timeString = DateTimeFormatter.ofPattern("HH:mm").format(LocalTime.now())
+        showHud = true
+        delay(2_500L)
+        showHud = false
     }
 
     val activeMining = sessions.filter { it.account.enabled && it.minerStatus == "Mining" }
-    val driftY = ((clockTick - 2) * 14).dp
-    val driftX = (((clockTick % 3) - 1) * 10).dp
 
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black)
             .pointerInput(Unit) {
-                detectTapGestures(onDoubleTap = { onExit() })
+                detectTapGestures(
+                    onTap = { peekTrigger++ },
+                    onDoubleTap = { onExit() }
+                )
             }
             .testTag("night_screen_overlay"),
         contentAlignment = Alignment.Center
     ) {
-        Column(
-            modifier = Modifier
-                .offset(x = driftX, y = driftY)
-                .padding(32.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(10.dp)
+        AnimatedVisibility(
+            visible = showHud,
+            enter = fadeIn(),
+            exit = fadeOut()
         ) {
-            Icon(
-                imageVector = Icons.Default.Bedtime,
-                contentDescription = null,
-                tint = Color(0xFF2B6B52),
-                modifier = Modifier.size(28.dp)
-            )
-            Text(
-                text = timeString,
-                fontFamily = JetBrainsMonoFamily,
-                fontSize = 42.sp,
-                fontWeight = FontWeight.Light,
-                color = Color(0xFF4F6B60)
-            )
-            if (activeMining.isEmpty()) {
-                Text(
-                    text = "Standing by • ${sessions.count { it.account.enabled }} account(s)",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = Color(0xFF4A4A4A)
+            Column(
+                modifier = Modifier.padding(32.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Bedtime,
+                    contentDescription = null,
+                    tint = Color(0xFF2B6B52),
+                    modifier = Modifier.size(26.dp)
                 )
-            } else {
-                activeMining.forEach { s ->
+                Text(
+                    text = timeString,
+                    fontFamily = JetBrainsMonoFamily,
+                    fontSize = 38.sp,
+                    fontWeight = FontWeight.Light,
+                    color = Color(0xFF4F6B60)
+                )
+                if (activeMining.isEmpty()) {
                     Text(
-                        text = "${s.account.platform.displayName}: ${s.progress.minedChannel} • ${s.progress.dropCaptionText}",
-                        fontFamily = JetBrainsMonoFamily,
+                        text = "Standing by • ${sessions.count { it.account.enabled }} account(s)",
                         style = MaterialTheme.typography.bodyMedium,
-                        color = Color(0xFF426356)
+                        color = Color(0xFF4A4A4A)
                     )
+                } else {
+                    activeMining.forEach { s ->
+                        Text(
+                            text = "${s.account.platform.displayName}: ${s.progress.minedChannel} • ${s.progress.dropCaptionText}",
+                            fontFamily = JetBrainsMonoFamily,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = Color(0xFF426356)
+                        )
+                    }
                 }
+                Spacer(modifier = Modifier.height(12.dp))
+                Text(
+                    text = "Pitch-black in 2s • Tap to peek • Double-tap to exit",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Color(0xFF3E3E3E)
+                )
             }
-            Spacer(modifier = Modifier.height(18.dp))
-            Text(
-                text = "Double-tap anywhere to exit AMOLED Night Screen",
-                style = MaterialTheme.typography.labelSmall,
-                color = Color(0xFF333333)
-            )
         }
     }
 }

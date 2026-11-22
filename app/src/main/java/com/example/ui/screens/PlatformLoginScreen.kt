@@ -50,6 +50,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import com.example.core.logging.AppLogger
 import com.example.core.models.Platform
 import com.example.ui.theme.KickGreen
 import com.example.ui.theme.LocalDropColors
@@ -85,11 +86,17 @@ fun PlatformLoginScreen(
         val token = detectedToken ?: return
         if (hasAutoSubmitted) return
         hasAutoSubmitted = true
+        runCatching { CookieManager.getInstance().flush() }
+        val finalName = detectedUsername.ifBlank { "${platform.displayName} User" }
+        AppLogger.info(
+            "Login",
+            "${platform.displayName} session captured for $finalName (cookieLen=${detectedCookieHeader.length})"
+        )
         onLoginComplete(
             platform,
             existingAccountId,
             token,
-            detectedUsername.ifBlank { "${platform.displayName} User" },
+            finalName,
             detectedCookieHeader
         )
         onBack()

@@ -92,9 +92,18 @@ class WebViewMiningBridge {
                         }
                     }
                     val meterAcc = if (platform == Platform.TWITCH) activeTwitchMeterAccountId else activeKickMeterAccountId
-                    if (!meterAcc.isNullOrBlank() && (url.contains(".ts") || url.contains(".m3u8") || url.contains("gql.twitch.tv") || url.contains("web.kick.com"))) {
-                        val estimated = if (url.contains(".ts")) 45_000L else 4_096L
-                        NetworkMeterRegistry.forAccount(meterAcc).recordBytes(estimated)
+                    if (!meterAcc.isNullOrBlank()) {
+                        val lower = url.lowercase()
+                        val estimated = when {
+                            lower.contains(".ts") || lower.contains(".m4s") || lower.contains(".aac") ||
+                                lower.contains("live-video.net") || lower.contains("playback.") -> 45_000L
+                            lower.contains(".m3u8") || lower.contains("gql.twitch.tv") ||
+                                lower.contains("web.kick.com") || lower.contains("kick.com/api") -> 4_096L
+                            else -> 0L
+                        }
+                        if (estimated > 0L) {
+                            NetworkMeterRegistry.forAccount(meterAcc).recordBytes(estimated)
+                        }
                     }
                     return super.shouldInterceptRequest(view, request)
                 }
@@ -263,7 +272,7 @@ class WebViewMiningBridge {
             }
 
             // Dismiss 18+/cookie gates, pick lowest quality (160p), mute, and force playback
-            evaluateJs(
+            val playRes = evaluateJs(
                 webView,
                 """
                 (() => {
@@ -286,11 +295,13 @@ class WebViewMiningBridge {
                         v.muted = true;
                         v.volume = 0;
                         if (v.paused) v.play().catch(() => {});
+                        return 'video:' + (v.paused ? 'paused' : 'playing');
                     }
-                    return 'ok';
+                    return 'no-video';
                 })();
                 """.trimIndent()
             )
+            AppLogger.info("KickWebView", "Opened $url -> $playRes")
         }
 
     suspend fun executeKickFetch(
@@ -300,7 +311,10 @@ class WebViewMiningBridge {
         url: String,
         jsonBody: String? = null
     ): String? = kickMutex.withLock {
-        val webView = kickWebView ?: return@withLock null
+        val webView = kickWebView ?: run {
+            AppLogger.warn("KickWebView", "Kick WebView not initialized yet for $url")
+            return@withLock null
+        }
         activeKickMeterAccountId = accountId
 
         val currentUrl = withContext(Dispatchers.Main) {
@@ -314,10 +328,22 @@ class WebViewMiningBridge {
                 val deferred = CompletableDeferred<Unit>()
                 kickPageFinished = deferred
                 webView.loadUrl("https://kick.com")
-                withTimeoutOrNull(12_000L) { deferred.await() }
+                val loaded = withTimeoutOrNull(12_000L) { deferred.await() }
+                if (loaded == null) {
+                    AppLogger.warn("KickWebView", "Timed out waiting for kick.com origin load")
+                }
             }
         }
 
+        val headersJson = buildString {
+            append("'Accept': 'application/json'")
+            if (jsonBody != null) {
+                append(", 'Content-Type': 'application/json'")
+            }
+            append(", 'Authorization': 'Bearer ' + decodeURIComponent(")
+            append(JSONObject.quote(sessionToken))
+            append(")")
+        }
         val bodyPart = if (jsonBody != null) ", body: ${JSONObject.quote(jsonBody)}" else ""
         val js = """
             (async () => {
@@ -325,11 +351,7 @@ class WebViewMiningBridge {
                     const r = await fetch(${JSONObject.quote(url)}, {
                         method: ${JSONObject.quote(method)},
                         credentials: 'include',
-                        headers: {
-                            'Accept': 'application/json',
-                            'Content-Type': 'application/json',
-                            'Authorization': 'Bearer ' + decodeURIComponent(${JSONObject.quote(sessionToken)})
-                        }$bodyPart
+                        headers: { $headersJson }$bodyPart
                     });
                     const txt = await r.text();
                     window.__sdcLastFetch = JSON.stringify({ ok: r.ok, status: r.status, body: txt });
@@ -343,7 +365,7 @@ class WebViewMiningBridge {
             webView.evaluateJavascript("window.__sdcLastFetch = null; $js", null)
         }
 
-        val deadline = System.currentTimeMillis() + 12_000L
+        val deadline = System.currentTimeMillis() + 10_000L
         while (System.currentTimeMillis() < deadline) {
             val res = evaluateJs(webView, "window.__sdcLastFetch")
             if (!res.isNullOrBlank() && res != "null") {
@@ -354,10 +376,14 @@ class WebViewMiningBridge {
                     NetworkMeterRegistry.forAccount(accountId).recordBytes(body.length.toLong())
                     return@withLock body
                 }
+                val status = parsed?.optInt("status", -1) ?: -1
+                val errBody = parsed?.optString("body").orEmpty().take(180)
+                AppLogger.warn("KickWebView", "$method $url failed via WebView (status=$status): $errBody")
                 return@withLock null
             }
             kotlinx.coroutines.delay(250L)
         }
+        AppLogger.warn("KickWebView", "$method $url timed out in WebView fetch")
         null
     }
 

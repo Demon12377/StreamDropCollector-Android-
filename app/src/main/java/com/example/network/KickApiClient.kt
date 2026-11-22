@@ -1,5 +1,6 @@
 package com.example.network
 
+import android.webkit.CookieManager
 import com.example.core.logging.AppLogger
 import com.example.core.models.DropsCampaign
 import com.example.core.models.DropsReward
@@ -34,7 +35,8 @@ import java.util.concurrent.TimeUnit
 data class KickCampaignFetchResult(
     val campaigns: List<DropsCampaign>,
     val knownGames: List<KnownGameEntry>,
-    val username: String? = null
+    val username: String? = null,
+    val apiReachable: Boolean = true
 )
 
 class KickApiClient(
@@ -52,6 +54,30 @@ class KickApiClient(
     fun isClaimBlockedUnlinked(accountId: String, campaignId: String, rewardId: String): Boolean =
         unlinkedClaims.contains("$accountId#$campaignId#$rewardId")
 
+    private fun buildKickCookieHeader(sessionToken: String): Pair<String, String?> {
+        val cm = runCatching { CookieManager.getInstance() }.getOrNull()
+        val rawMain = cm?.getCookie("https://kick.com").orEmpty()
+        val rawWeb = cm?.getCookie("https://web.kick.com").orEmpty()
+        val merged = linkedMapOf<String, String>()
+        listOf(rawMain, rawWeb).forEach { header ->
+            header.split(';').forEach { part ->
+                val trimmed = part.trim()
+                val eq = trimmed.indexOf('=')
+                if (eq > 0) {
+                    merged[trimmed.substring(0, eq).trim()] = trimmed.substring(eq + 1).trim()
+                }
+            }
+        }
+        if (sessionToken.isNotBlank() && !merged.containsKey("session_token")) {
+            merged["session_token"] = sessionToken
+        }
+        val xsrf = merged["XSRF-TOKEN"]?.let { raw ->
+            runCatching { URLDecoder.decode(raw, "UTF-8") }.getOrDefault(raw)
+        }
+        val header = merged.entries.joinToString("; ") { "${it.key}=${it.value}" }
+        return header to xsrf
+    }
+
     private suspend fun fetchAuthenticated(
         accountId: String,
         sessionToken: String,
@@ -59,17 +85,24 @@ class KickApiClient(
         url: String,
         bodyJson: String? = null
     ): String? {
-        // Try in-page WebView fetch first (bypasses Cloudflare JS challenges), fallback to OkHttp
-        val viaWebView = webViewBridge.executeKickFetch(accountId, sessionToken, method, url, bodyJson)
-        if (!viaWebView.isNullOrBlank()) return viaWebView
-
-        return withContext(Dispatchers.IO) {
+        // 1. Fast OkHttp attempt with live WebView CookieManager cookies (cf_clearance + session_token)
+        val (directBody, httpCode) = withContext(Dispatchers.IO) {
             val bearer = runCatching { URLDecoder.decode(sessionToken, "UTF-8") }.getOrDefault(sessionToken)
+            val (cookieHeader, xsrfToken) = buildKickCookieHeader(sessionToken)
             val builder = Request.Builder()
                 .url(url)
                 .header("Accept", "application/json")
                 .header("Authorization", "Bearer $bearer")
-                .header("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/130.0.0.0 Mobile Safari/537.36")
+                .header("Origin", "https://kick.com")
+                .header("Referer", "https://kick.com/")
+                .header("User-Agent", "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36")
+
+            if (cookieHeader.isNotBlank()) {
+                builder.header("Cookie", cookieHeader)
+            }
+            if (!xsrfToken.isNullOrBlank()) {
+                builder.header("X-XSRF-TOKEN", xsrfToken)
+            }
 
             when (method.uppercase()) {
                 "POST" -> builder.post((bodyJson ?: "{}").toRequestBody("application/json; charset=utf-8".toMediaType()))
@@ -80,10 +113,26 @@ class KickApiClient(
                 okHttp.newCall(builder.build()).execute().use { resp ->
                     val text = resp.body?.string().orEmpty()
                     NetworkMeterRegistry.forAccount(accountId).recordBytes(text.length.toLong())
-                    if (resp.isSuccessful) text else null
+                    if (resp.isSuccessful) {
+                        text to resp.code
+                    } else {
+                        AppLogger.warn("KickHttp", "$method $url -> HTTP ${resp.code}: ${text.take(150)}")
+                        null to resp.code
+                    }
                 }
-            }.getOrNull()
+            }.getOrElse { ex ->
+                AppLogger.warn("KickHttp", "$method $url exception: ${ex.message}")
+                null to 0
+            }
         }
+        if (!directBody.isNullOrBlank()) return directBody
+
+        // 2. Fallback to in-page WebView fetch if blocked (e.g. HTTP 403 Cloudflare or 0)
+        if (httpCode == 403 || httpCode == 0) {
+            val viaWebView = webViewBridge.executeKickFetch(accountId, sessionToken, method, url, bodyJson)
+            if (!viaWebView.isNullOrBlank()) return viaWebView
+        }
+        return null
     }
 
     suspend fun fetchUserProfile(accountId: String, sessionToken: String): Pair<Long?, String?> {
@@ -105,7 +154,10 @@ class KickApiClient(
             sessionToken,
             "GET",
             "https://web.kick.com/api/v1/drops/campaigns"
-        ) ?: return KickCampaignFetchResult(emptyList(), emptyList())
+        ) ?: run {
+            AppLogger.warn("KickDrops", "Failed to load https://web.kick.com/api/v1/drops/campaigns")
+            return KickCampaignFetchResult(emptyList(), emptyList(), apiReachable = false)
+        }
 
         val knownGames = mutableListOf<KnownGameEntry>()
         val campaigns = mutableListOf<DropsCampaign>()
@@ -343,69 +395,94 @@ class KickApiClient(
         }.getOrDefault(emptyList())
     }
 
-    suspend fun getChannelLiveSnapshot(slug: String): LiveChannelSnapshot? = withContext(Dispatchers.IO) {
-        val req = Request.Builder()
-            .url("https://kick.com/api/v2/channels/${slug.lowercase()}")
-            .header("Accept", "application/json")
-            .header("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/130.0.0.0 Mobile Safari/537.36")
-            .get()
-            .build()
-
-        runCatching {
-            okHttp.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) return@runCatching null
-                val body = resp.body?.string().orEmpty()
-                val obj = json.parseToJsonElement(body).jsonObject
-                val livestream = obj["livestream"] as? JsonObject
-                val isLive = livestream != null && livestream["is_live"]?.jsonPrimitive?.booleanOrNull == true
-                val viewers = livestream?.get("viewer_count")?.jsonPrimitive?.intOrNull ?: 0
-                val category = livestream?.get("categories")?.jsonArray?.firstOrNull()?.jsonObject
-                LiveChannelSnapshot(
-                    login = slug.lowercase(),
-                    displayName = obj["user"]?.jsonObject?.get("username")?.jsonPrimitive?.content ?: slug,
-                    isLive = isLive,
-                    viewerCount = viewers,
-                    gameName = category?.get("name")?.jsonPrimitive?.content,
-                    gameSlug = category?.get("slug")?.jsonPrimitive?.content,
-                    title = livestream?.get("session_title")?.jsonPrimitive?.content
-                )
-            }
+    suspend fun getChannelLiveSnapshot(
+        slug: String,
+        accountId: String = "",
+        sessionToken: String = ""
+    ): LiveChannelSnapshot? {
+        val url = "https://kick.com/api/v2/channels/${slug.lowercase()}"
+        val body = fetchPublicOrKickWebView(url, accountId, sessionToken) ?: return null
+        return runCatching {
+            val obj = json.parseToJsonElement(body).jsonObject
+            val livestream = obj["livestream"] as? JsonObject
+            val isLive = livestream != null && livestream["is_live"]?.jsonPrimitive?.booleanOrNull == true
+            val viewers = livestream?.get("viewer_count")?.jsonPrimitive?.intOrNull ?: 0
+            val category = livestream?.get("categories")?.jsonArray?.firstOrNull()?.jsonObject
+            LiveChannelSnapshot(
+                login = slug.lowercase(),
+                displayName = obj["user"]?.jsonObject?.get("username")?.jsonPrimitive?.content ?: slug,
+                isLive = isLive,
+                viewerCount = viewers,
+                gameName = category?.get("name")?.jsonPrimitive?.content,
+                gameSlug = category?.get("slug")?.jsonPrimitive?.content,
+                title = livestream?.get("session_title")?.jsonPrimitive?.content
+            )
         }.getOrNull()
     }
 
-    suspend fun getTopLiveChannels(categorySlug: String?): List<LiveChannelSnapshot> = withContext(Dispatchers.IO) {
+    suspend fun getTopLiveChannels(
+        categorySlug: String?,
+        accountId: String = "",
+        sessionToken: String = ""
+    ): List<LiveChannelSnapshot> {
         val url = if (!categorySlug.isNullOrBlank()) {
             "https://kick.com/stream/livestreams/en?page=1&limit=15&category=${categorySlug.lowercase()}&sort=viewers_high_to_low"
         } else {
             "https://kick.com/stream/livestreams/en?page=1&limit=15&sort=viewers_high_to_low"
         }
-        val req = Request.Builder()
-            .url(url)
-            .header("Accept", "application/json")
-            .header("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/130.0.0.0 Mobile Safari/537.36")
-            .get()
-            .build()
-
-        runCatching {
-            okHttp.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) return@runCatching emptyList()
-                val body = resp.body?.string().orEmpty()
-                val root = json.parseToJsonElement(body).jsonObject
-                val data = root["data"]?.jsonArray ?: return@runCatching emptyList()
-                data.mapNotNull { el ->
-                    val obj = el.jsonObject
-                    val channel = obj["channel"]?.jsonObject ?: return@mapNotNull null
-                    val slug = channel["slug"]?.jsonPrimitive?.content ?: return@mapNotNull null
-                    LiveChannelSnapshot(
-                        login = slug.lowercase(),
-                        displayName = channel["user"]?.jsonObject?.get("username")?.jsonPrimitive?.content ?: slug,
-                        isLive = true,
-                        viewerCount = obj["viewer_count"]?.jsonPrimitive?.intOrNull ?: 0,
-                        title = obj["session_title"]?.jsonPrimitive?.content
-                    )
-                }
+        val body = fetchPublicOrKickWebView(url, accountId, sessionToken) ?: return emptyList()
+        return runCatching {
+            val root = json.parseToJsonElement(body).jsonObject
+            val data = root["data"]?.jsonArray ?: return@runCatching emptyList()
+            data.mapNotNull { el ->
+                val obj = el.jsonObject
+                val channel = obj["channel"]?.jsonObject ?: return@mapNotNull null
+                val slug = channel["slug"]?.jsonPrimitive?.content ?: return@mapNotNull null
+                LiveChannelSnapshot(
+                    login = slug.lowercase(),
+                    displayName = channel["user"]?.jsonObject?.get("username")?.jsonPrimitive?.content ?: slug,
+                    isLive = true,
+                    viewerCount = obj["viewer_count"]?.jsonPrimitive?.intOrNull ?: 0,
+                    title = obj["session_title"]?.jsonPrimitive?.content
+                )
             }
         }.getOrDefault(emptyList())
+    }
+
+    private suspend fun fetchPublicOrKickWebView(
+        url: String,
+        accountId: String,
+        sessionToken: String
+    ): String? {
+        val (directBody, code) = withContext(Dispatchers.IO) {
+            val (cookieHeader, _) = buildKickCookieHeader(sessionToken)
+            val builder = Request.Builder()
+                .url(url)
+                .header("Accept", "application/json")
+                .header("Referer", "https://kick.com/")
+                .header("Origin", "https://kick.com")
+                .header("User-Agent", "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36")
+            if (cookieHeader.isNotBlank()) builder.header("Cookie", cookieHeader)
+
+            runCatching {
+                okHttp.newCall(builder.build()).execute().use { resp ->
+                    val text = resp.body?.string().orEmpty()
+                    if (resp.isSuccessful) text to resp.code
+                    else {
+                        AppLogger.warn("KickPublic", "GET $url -> HTTP ${resp.code}")
+                        null to resp.code
+                    }
+                }
+            }.getOrElse { ex ->
+                AppLogger.warn("KickPublic", "GET $url failed: ${ex.message}")
+                null to 0
+            }
+        }
+        if (!directBody.isNullOrBlank()) return directBody
+        if ((code == 403 || code == 0) && accountId.isNotBlank()) {
+            return webViewBridge.executeKickFetch(accountId, sessionToken, "GET", url, null)
+        }
+        return null
     }
 
     private fun parseIso(raw: String?): Long {
