@@ -10,6 +10,8 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
 import com.example.core.logging.AppLogger
 import com.example.core.models.Platform
 import kotlinx.coroutines.CompletableDeferred
@@ -66,6 +68,7 @@ class WebViewMiningBridge {
 
             CookieManager.getInstance().setAcceptCookie(true)
             CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+            ensureTabMuted(this)
 
             webViewClient = object : WebViewClient() {
                 override fun onPageFinished(view: WebView?, url: String?) {
@@ -116,6 +119,17 @@ class WebViewMiningBridge {
             kickWebView = webView
         }
         return webView
+    }
+
+    private fun ensureTabMuted(webView: WebView): Boolean {
+        return runCatching {
+            if (WebViewFeature.isFeatureSupported(WebViewFeature.MUTE_AUDIO)) {
+                WebViewCompat.setAudioMuted(webView, true)
+                WebViewCompat.isAudioMuted(webView)
+            } else {
+                false
+            }
+        }.getOrDefault(false)
     }
 
     fun getCookie(url: String, name: String): String? {
@@ -221,16 +235,28 @@ class WebViewMiningBridge {
             withTimeoutOrNull(15_000L) { deferred.await() }
         }
 
-        // Dismiss mature gate + force lowest quality 160p30
+        // Mute at Chromium WebView tab level so Twitch thinks player sound is ON (volume=1.0)
+        val tabMuted = withContext(Dispatchers.Main) { ensureTabMuted(webView) }
         evaluateJs(
             webView,
             """
             (() => {
                 localStorage.setItem('video-quality', '{"default":"160p30"}');
+                localStorage.setItem('video-muted', '{"default":false}');
+                localStorage.setItem('volume', '1');
                 const btn = document.querySelector('button[data-a-target="content-classification-gate-overlay-start-watching-button"]');
                 if (btn) btn.click();
                 const v = document.querySelector('video');
-                if (v) { v.muted = true; }
+                if (v) {
+                    if ($tabMuted) {
+                        v.muted = false;
+                        v.volume = 1.0;
+                    } else {
+                        v.muted = true;
+                        v.volume = 0;
+                    }
+                    if (v.paused) v.play().catch(() => {});
+                }
                 return 'ok';
             })();
             """.trimIndent()
@@ -291,8 +317,9 @@ class WebViewMiningBridge {
         }
     }
 
-    private suspend fun applyKickLowestQualityScript(webView: WebView): String? =
-        evaluateJs(
+    private suspend fun applyKickLowestQualityScript(webView: WebView): String? {
+        val tabMuted = withContext(Dispatchers.Main) { ensureTabMuted(webView) }
+        return evaluateJs(
             webView,
             """
             (() => {
@@ -300,6 +327,10 @@ class WebViewMiningBridge {
                     localStorage.setItem('kick_video_quality', '160p');
                     localStorage.setItem('videoQuality', '160p');
                     localStorage.setItem('quality', '160p');
+                    if ($tabMuted) {
+                        localStorage.setItem('kick_video_muted', 'false');
+                        localStorage.setItem('volume', '1');
+                    }
                 } catch (_) {}
                 const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
                 for (const b of btns) {
@@ -307,6 +338,10 @@ class WebViewMiningBridge {
                     if (t.includes('start watching') || t.includes('18 or older') || t === 'accept' || t.includes('i am 18')) {
                         b.click();
                     }
+                }
+                if ($tabMuted) {
+                    const unmuteBtn = document.querySelector('button[aria-label*="unmute" i]');
+                    if (unmuteBtn) unmuteBtn.click();
                 }
                 const v = document.querySelector('video');
                 const needsLowerQuality = !v || !v.videoHeight || v.videoHeight > 240;
@@ -323,16 +358,30 @@ class WebViewMiningBridge {
                     if (low) low.click();
                 }
                 if (v) {
-                    v.muted = true;
-                    v.volume = 0;
-                    if (v.paused) v.play().catch(() => {});
+                    if ($tabMuted) {
+                        v.muted = false;
+                        v.volume = 1.0;
+                    } else {
+                        v.muted = true;
+                        v.volume = 0;
+                    }
+                    if (v.paused) {
+                        v.play().catch(() => {
+                            // If autoplay policy blocks unmuted start on rare OEM builds, kick-start muted then restore
+                            v.muted = true;
+                            v.play().then(() => {
+                                if ($tabMuted) { v.muted = false; v.volume = 1.0; }
+                            }).catch(() => {});
+                        });
+                    }
                     const qLabel = v.videoHeight ? (v.videoHeight + 'p') : 'auto';
-                    return 'video:' + (v.paused ? 'paused' : 'playing') + '@' + qLabel;
+                    return 'video:' + (v.paused ? 'paused' : 'playing') + '@' + qLabel + ' (playerSoundOn=' + (!v.muted) + ', tabMuted=$tabMuted)';
                 }
                 return 'no-video';
             })();
             """.trimIndent()
         )
+    }
 
     suspend fun executeKickFetch(
         accountId: String,
