@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">DropCollector</string>
+    <string name="app_full_title">Stream Drop Collector</string>
+    <string name="app_subtitle">by tsgsOFFICIAL</string>
+
+    <!-- Navigation -->
+    <string name="nav_dashboard">Dashboard</string>
+    <string name="nav_inventory">Inventory</string>
+    <string name="nav_settings">Settings</string>
+    <string name="nav_help">Help</string>
+
+    <!-- Dashboard -->
+    <string name="dashboard_title">Dashboard</string>
+    <string name="miner_status_title">Miner Status</string>
+    <string name="accounts_card_title">Accounts</string>
+    <string name="accounts_card_subtitle">Every account mines in parallel, each with its own isolated login.</string>
+    <string name="add_twitch_account">Add Twitch account</string>
+    <string name="add_kick_account">Add Kick account</string>
+    <string name="no_accounts_title">No streaming accounts added</string>
+    <string name="no_accounts_hint">Add a Twitch or Kick account above to start tracking and mining campaign drops automatically.</string>
+    <string name="helix_device_prompt_title">Authorize Twitch Helix</string>
+    <string name="helix_device_prompt_body">One-time authorization used only for live Twitch stream metadata and EventSub updates.</string>
+
+    <!-- Inventory -->
+    <string name="inventory_title">Inventory</string>
+    <string name="hide_completed_campaigns">Hide completed</string>
+    <string name="no_active_campaigns">No active drops campaigns</string>
+    <string name="reward_campaigns_title">Reward campaigns</string>
+    <string name="reward_campaigns_subtitle">Twitch open reward campaigns. Watch time counts in the participating categories after regular drops, and finished rewards are claimed manually on Twitch.</string>
+    <string name="ignored_games_title">Ignored games</string>
+    <string name="ignored_games_hint">Ignored games are excluded from mining and hidden from active drops until allowed again.</string>
+
+    <!-- Settings -->
+    <string name="settings_title">Settings</string>
+    <string name="danger_zone">DANGER ZONE</string>
+    <string name="remove_all_accounts_desc">Permanently delete ALL logged-in accounts and saved cookies from this device.</string>
+    <string name="remove_all_accounts_btn">Remove ALL Accounts</string>
+
+    <!-- Help -->
+    <string name="help_title">Help &amp; Support</string>
+    <string name="creator_credit">Made with rage, caffeine, and zero sleep by tsgsOFFICIAL</string>
+
+    <!-- Content descriptions -->
+    <string name="cd_app_logo">Stream Drop Collector logo</string>
+    <string name="cd_campaign_art">Campaign game artwork</string>
+    <string name="cd_reward_art">Drop reward artwork</string>
+    <string name="cd_level_badge">Kick viewer level badge</string>
+    <string name="cd_discord_icon">Discord icon</string>
+    <string name="cd_github_icon">GitHub icon</string>
+</resources>
