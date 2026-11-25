@@ -4,6 +4,8 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import android.view.View
+import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -51,12 +53,33 @@ class WebViewMiningBridge {
     private var twitchPageFinished: CompletableDeferred<Unit>? = null
     private var kickPageFinished: CompletableDeferred<Unit>? = null
 
+    private class BackgroundMiningWebView(context: Context) : WebView(context) {
+        @Volatile
+        var keepAliveInBackground: Boolean = true
+
+        override fun onWindowVisibilityChanged(visibility: Int) {
+            super.onWindowVisibilityChanged(if (keepAliveInBackground) VISIBLE else visibility)
+        }
+
+        override fun dispatchWindowVisibilityChanged(visibility: Int) {
+            super.dispatchWindowVisibilityChanged(if (keepAliveInBackground) VISIBLE else visibility)
+        }
+
+        override fun onVisibilityChanged(changedView: View, visibility: Int) {
+            super.onVisibilityChanged(changedView, if (keepAliveInBackground) VISIBLE else visibility)
+        }
+    }
+
     @SuppressLint("SetJavaScriptEnabled")
     fun createOrGetWebView(context: Context, platform: Platform): WebView {
         val existing = if (platform == Platform.TWITCH) twitchWebView else kickWebView
-        if (existing != null) return existing
+        if (existing != null) {
+            (existing.parent as? ViewGroup)?.removeView(existing)
+            return existing
+        }
 
-        val webView = WebView(context).apply {
+        val webView = BackgroundMiningWebView(context.applicationContext).apply {
+            keepAliveInBackground = true
             settings.javaScriptEnabled = true
             settings.domStorageEnabled = true
             settings.mediaPlaybackRequiresUserGesture = false
@@ -73,6 +96,9 @@ class WebViewMiningBridge {
             webViewClient = object : WebViewClient() {
                 override fun onPageFinished(view: WebView?, url: String?) {
                     super.onPageFinished(view, url)
+                    if (url != null && !url.startsWith("about:")) {
+                        view?.evaluateJavascript(PAGE_VISIBILITY_SPOOF_JS, null)
+                    }
                     if (platform == Platform.TWITCH) {
                         twitchPageFinished?.complete(Unit)
                     } else {
@@ -198,7 +224,9 @@ class WebViewMiningBridge {
 
     suspend fun suspendWebViewForLowPower(platform: Platform) = withContext(Dispatchers.Main) {
         val wv = if (platform == Platform.TWITCH) twitchWebView else kickWebView
+        (wv as? BackgroundMiningWebView)?.keepAliveInBackground = false
         wv?.apply {
+            evaluateJavascript("window.__sdcKeepPlaying = false;", null)
             stopLoading()
             loadUrl("about:blank")
             onPause()
@@ -216,7 +244,9 @@ class WebViewMiningBridge {
         activeTwitchMeterAccountId = accountId
 
         if (headOnly) {
+            (webView as? BackgroundMiningWebView)?.keepAliveInBackground = false
             withContext(Dispatchers.Main) {
+                webView.evaluateJavascript("window.__sdcKeepPlaying = false;", null)
                 webView.stopLoading()
                 webView.loadUrl("about:blank")
                 webView.onPause()
@@ -225,6 +255,7 @@ class WebViewMiningBridge {
             return@withLock true
         }
 
+        (webView as? BackgroundMiningWebView)?.keepAliveInBackground = true
         withContext(Dispatchers.Main) {
             webView.resumeTimers()
             webView.onResume()
@@ -241,6 +272,8 @@ class WebViewMiningBridge {
             webView,
             """
             (() => {
+                $PAGE_VISIBILITY_SPOOF_JS
+                window.__sdcKeepPlaying = true;
                 localStorage.setItem('video-quality', '{"default":"160p30"}');
                 localStorage.setItem('video-muted', '{"default":false}');
                 localStorage.setItem('volume', '1');
@@ -254,6 +287,14 @@ class WebViewMiningBridge {
                     } else {
                         v.muted = true;
                         v.volume = 0;
+                    }
+                    if (!v.__sdcPauseGuard) {
+                        v.__sdcPauseGuard = true;
+                        v.addEventListener('pause', () => {
+                            if (window.__sdcKeepPlaying && !v.ended) {
+                                setTimeout(() => { if (window.__sdcKeepPlaying && v.paused) v.play().catch(() => {}); }, 400);
+                            }
+                        });
                     }
                     if (v.paused) v.play().catch(() => {});
                 }
@@ -272,6 +313,7 @@ class WebViewMiningBridge {
     ) =
         kickMutex.withLock {
             val webView = kickWebView ?: return@withLock
+            (webView as? BackgroundMiningWebView)?.keepAliveInBackground = true
             activeKickMeterAccountId = accountId
             val currentUrl = withContext(Dispatchers.Main) {
                 webView.resumeTimers()
@@ -307,9 +349,43 @@ class WebViewMiningBridge {
             AppLogger.info("KickWebView", "Opened $url -> $playRes")
         }
 
+    suspend fun ensureBackgroundPlayback(platform: Platform) {
+        val webView = (if (platform == Platform.TWITCH) twitchWebView else kickWebView) ?: return
+        val wvUrl = withContext(Dispatchers.Main) {
+            (webView as? BackgroundMiningWebView)?.keepAliveInBackground = true
+            webView.resumeTimers()
+            webView.onResume()
+            webView.url.orEmpty()
+        }
+        val expectedHost = if (platform == Platform.TWITCH) "twitch.tv" else "kick.com"
+        if (!wvUrl.contains(expectedHost, ignoreCase = true)) return
+
+        val tabMuted = withContext(Dispatchers.Main) { ensureTabMuted(webView) }
+        evaluateJs(
+            webView,
+            """
+            (() => {
+                $PAGE_VISIBILITY_SPOOF_JS
+                window.__sdcKeepPlaying = true;
+                const v = document.querySelector('video');
+                if (v) {
+                    if ($tabMuted) { v.muted = false; v.volume = 1.0; }
+                    if (v.paused && !v.ended) v.play().catch(() => {});
+                }
+                return 'alive';
+            })();
+            """.trimIndent()
+        )
+    }
+
     suspend fun nudgeKickPlayerLowQuality() = kickMutex.withLock {
         val webView = kickWebView ?: return@withLock
-        val currentUrl = withContext(Dispatchers.Main) { webView.url.orEmpty() }
+        (webView as? BackgroundMiningWebView)?.keepAliveInBackground = true
+        val currentUrl = withContext(Dispatchers.Main) {
+            webView.resumeTimers()
+            webView.onResume()
+            webView.url.orEmpty()
+        }
         if (!currentUrl.contains("kick.com", ignoreCase = true)) return@withLock
         val res = applyKickLowestQualityScript(webView)
         if (res?.contains("paused") == true || res?.contains("no-video") == true) {
@@ -323,6 +399,8 @@ class WebViewMiningBridge {
             webView,
             """
             (() => {
+                $PAGE_VISIBILITY_SPOOF_JS
+                window.__sdcKeepPlaying = true;
                 try {
                     localStorage.setItem('kick_video_quality', '160p');
                     localStorage.setItem('videoQuality', '160p');
@@ -365,6 +443,14 @@ class WebViewMiningBridge {
                         v.muted = true;
                         v.volume = 0;
                     }
+                    if (!v.__sdcPauseGuard) {
+                        v.__sdcPauseGuard = true;
+                        v.addEventListener('pause', () => {
+                            if (window.__sdcKeepPlaying && !v.ended) {
+                                setTimeout(() => { if (window.__sdcKeepPlaying && v.paused) v.play().catch(() => {}); }, 400);
+                            }
+                        });
+                    }
                     if (v.paused) {
                         v.play().catch(() => {
                             // If autoplay policy blocks unmuted start on rare OEM builds, kick-start muted then restore
@@ -381,6 +467,21 @@ class WebViewMiningBridge {
             })();
             """.trimIndent()
         )
+    }
+
+    companion object {
+        private val PAGE_VISIBILITY_SPOOF_JS = """
+            if (!window.__sdcVisPatched) {
+                window.__sdcVisPatched = true;
+                try {
+                    Object.defineProperty(document, 'hidden', { configurable: true, get: () => false });
+                    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'visible' });
+                    Object.defineProperty(document, 'webkitHidden', { configurable: true, get: () => false });
+                    document.addEventListener('visibilitychange', (e) => e.stopImmediatePropagation(), true);
+                    window.addEventListener('pagehide', (e) => e.stopImmediatePropagation(), true);
+                } catch (_) {}
+            }
+        """.trimIndent()
     }
 
     suspend fun executeKickFetch(

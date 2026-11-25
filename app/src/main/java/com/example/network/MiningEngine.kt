@@ -212,18 +212,20 @@ class MiningEngine(
                     val curEffective = ActiveCampaignFilter.resolveEffectiveSettings(latestAcc, curSettings)
                     val curSession = _sessions.value.firstOrNull { it.account.id == accountId }
                     val activeChannel = curSession?.progress?.minedChannel.orEmpty()
-                    if (latestAcc.platform == Platform.TWITCH &&
-                        curSession?.minerStatus == "Mining" &&
-                        activeChannel.isNotBlank() &&
-                        (curEffective.headOnlyMining || curSettings.overnightBatterySaver)
-                    ) {
-                        val clientId = accountClientIds[accountId] ?: creds.clientId.ifBlank { "kimne78kx3ncx6brgo4mv6wki5h1ko" }
-                        headHeartbeat.pulseTwitchChannel(
-                            accountId = accountId,
-                            authToken = creds.authToken,
-                            clientId = clientId,
-                            channelLogin = activeChannel
-                        )
+                    if (curSession?.minerStatus == "Mining" && activeChannel.isNotBlank()) {
+                        if (latestAcc.platform == Platform.TWITCH &&
+                            (curEffective.headOnlyMining || curSettings.overnightBatterySaver)
+                        ) {
+                            val clientId = accountClientIds[accountId] ?: creds.clientId.ifBlank { "kimne78kx3ncx6brgo4mv6wki5h1ko" }
+                            headHeartbeat.pulseTwitchChannel(
+                                accountId = accountId,
+                                authToken = creds.authToken,
+                                clientId = clientId,
+                                channelLogin = activeChannel
+                            )
+                        } else {
+                            webViewBridge.ensureBackgroundPlayback(latestAcc.platform)
+                        }
                     }
                 }
                 if (breakEarlyForFailover) break
